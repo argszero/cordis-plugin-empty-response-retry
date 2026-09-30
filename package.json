@@ -1,0 +1,76 @@
+{
+  "name": "@argszero/cordis-plugin-empty-response-retry",
+  "description": "Makes an unattributed empty model attempt retryable, for the one seam that can tell. Discussion #8321: a `dsh-llm-pi-ai` route that relays an upstream empty response ends the turn, because `classifyPiAiError` has no rule matching the wording, so the text falls to the catch-all `PI_AI_ERROR`, and that is the one code `DEFAULT_RETRYABLE_CODES` does not carry (`EMPTY_RESPONSE`, `RATE_LIMIT`, `SERVER`, `TIMEOUT`, `TRANSPORT`) — `dsh-llm-retry` short-circuits on `!policy.retryableCodes.includes(failure.code)` and the step is never repeated, though the same adapter maps a locally detected zero-content completion to the retryable `EMPTY_RESPONSE`, so two paths that both mean \"the model produced nothing\" disagree. This plugin observes the public `llm/stream` waterfall — the one seam that sees an attempt and everything it produced — and rewrites that finish's `failure.code` to the by-value `EMPTY_RESPONSE` when the attempt ended in an unnamed error AND produced nothing at all; the retry executor then accepts the step on its own unchanged code gate. It is strictly narrower than the `retryableCodes: [..., PI_AI_ERROR]` workaround in the report, which widens every catch-all failure on a route: the two producers the adapter marks deliberately non-retryable (`pending`, `deferred` — a not-yet answer is not the safe repeat the principle is about) are excluded, as is any attempt that emitted a block, a token, or a Tool call, and any failure the adapter did name. Nothing buffered, nothing reordered, one boolean of state.",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/**/*.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/argszero/cordis-plugin-empty-response-retry.git"
+  },
+  "homepage": "https://github.com/argszero/cordis-plugin-empty-response-retry#readme",
+  "bugs": {
+    "url": "https://github.com/argszero/cordis-plugin-empty-response-retry/issues"
+  },
+  "keywords": [
+    "cordis",
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "guard",
+    "retry",
+    "llm",
+    "pi-ai",
+    "empty-response",
+    "classification",
+    "transient"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": ">=0.1.6-alpha.1 <0.1.7 || >=0.1.7-alpha.1 <0.2.0 || >=0.2.0-rc.1 <0.3.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-llm": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-llm-retry": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.0-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.0-rc.2",
+    "@types/node": "^22.10.2",
+    "semver": "^7.6.0",
+    "typescript": "^5.5.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "pretest": "tsc",
+    "test": "node --test \"test/*.spec.mjs\"",
+    "test:probe-lines": "node scripts/probe-lines.mjs",
+    "test:inject": "node scripts/inject-defects.mjs",
+    "prepublishOnly": "tsc"
+  },
+  "engines": {
+    "node": "^22.19 || >=24"
+  }
+}

@@ -1,0 +1,59 @@
+# The @argszero/cordis-plugin-empty-response-retry bundle patch: mount and go.
+#
+# Discussion #8321: a `dsh-llm-pi-ai` route behind OpenRouter relays an upstream
+# empty response, and the turn ends with no retry:
+#
+#   attempt t3s2 → error: PI_AI_ERROR Provider returned an empty response
+#   AGENT ERROR t3: Provider returned an empty response
+#
+# Seven attempt-level failures in two days on one route and not one `llm/retry`
+# event, though `dsh-llm-retry` was mounted and running.
+#
+# The code chain is short. pi-ai's OpenAI-completions adapter puts the provider's
+# text on the terminal `error` event verbatim; `classifyPiAiError`
+# (`packages/llm/llm-pi-ai/src/stream.ts`) is a chain of wordings, none of which
+# matches "Provider returned an empty response", so the text falls to the
+# catch-all `return 'PI_AI_ERROR'`; the agent loop forwards `finish.failure`
+# verbatim into `agent/request-error`; `dsh-llm-retry` decides on exactly one
+# field (`!policy.retryableCodes.includes(failure.code)`); and the default table
+# (`packages/llm/llm/src/retry-policy.ts`) is `EMPTY_RESPONSE`, `RATE_LIMIT`,
+# `SERVER`, `TIMEOUT`, `TRANSPORT` — no `PI_AI_ERROR`. The step is never repeated.
+#
+# The same adapter maps a LOCALLY detected zero-content completion to the
+# retryable `EMPTY_RESPONSE`, so two paths that both mean "the model produced
+# nothing" disagree, and the docstring of `EMPTY_RESPONSE_CODE` says which one is
+# right: "The attempt produced nothing durable, so retry policy treats it as safe
+# to repeat."
+#
+# This plugin observes the public `llm/stream` waterfall — the one seam that sees
+# an attempt AND everything it produced — and rewrites that finish's
+# `failure.code` to the by-value `EMPTY_RESPONSE` when the attempt
+#   * ended in an error, and
+#   * produced nothing at all (no block, no non-empty token delta, no Tool call),
+#   * with a code listed in `codes` (default: the catch-all `PI_AI_ERROR` alone),
+#   * whose message is not the adapter's own (`exceptMessages`, default `^pi-ai `).
+#
+# The retry executor then accepts the step on its own unchanged code gate. Only
+# the code changes: the provider's message, status and `providerRetryAfterMs` are
+# carried through, so the session log still shows what the provider said.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. `PI_AI_ERROR` is the adapter's catch-all, and
+# two of its producers are terminal on purpose — a pi-ai stream that ended
+# `pending` or `deferred` is a not-yet, not a failure, and re-sending it is not
+# the safe repeat the principle is about. A route-wide
+# `retryableCodes: [..., PI_AI_ERROR]` widens those too; this plugin excludes
+# them, because every message the adapter authors for this family begins with its
+# own `pi-ai ` prefix while provider-relayed text does not. The prefix rule fails
+# in the safe direction: a reworded `pending` makes the plugin decline to act
+# (leaving today's behaviour) rather than start retrying it. It also refuses any
+# attempt that produced content, any code the adapter did name, and any
+# cancellation — see the README.
+#
+# Nothing is buffered: every chunk is yielded the moment it arrives, passed
+# through by identity, and at most the last one is rewritten. Start with
+# mode='warn' to measure how often your own traffic hits the rule before letting
+# it change behaviour.
+
+- insert:
+    - id: empty-response-retry
+      name: '@argszero/cordis-plugin-empty-response-retry'
