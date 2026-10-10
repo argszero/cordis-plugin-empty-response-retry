@@ -3,7 +3,14 @@
 Makes an **unattributed empty model attempt** retryable — for the one seam that
 can tell that the attempt produced nothing.
 
-Answers [deepseek-ai/deepseek-harness discussion #8321](https://github.com/deepseek-ai/deepseek-harness/discussions/8321).
+Answers two reports of the same missing evidence, reached from opposite sides of
+the classifier:
+
+- [deepseek-ai/deepseek-harness discussion #8321](https://github.com/deepseek-ai/deepseek-harness/discussions/8321)
+  — an empty response the adapter could not name at all (`PI_AI_ERROR`).
+- [deepseek-ai/deepseek-harness discussion #9352](https://github.com/deepseek-ai/deepseek-harness/discussions/9352)
+  — a `400` with an empty body, named `INVALID_REQUEST` from the client's own
+  status line.
 
 ```sh
 npm install @argszero/cordis-plugin-empty-response-retry
@@ -12,6 +19,13 @@ npm install @argszero/cordis-plugin-empty-response-retry
 ---
 
 ## The gap
+
+There are two ways an attempt that produced nothing reaches the retry executor
+without a name, and each was reported separately (#8321 and #9352). This plugin
+handles both, because they are one fact: **the code was chosen without a
+provider-authored diagnosis.**
+
+### Report #8321: the adapter could not name the wording at all
 
 A route served by `dsh-llm-pi-ai` behind OpenRouter (`api: openai-completions`)
 answered a turn with nothing at all, and the turn ended:
@@ -81,6 +95,35 @@ disagree about (`packages/llm/llm/src/error.ts`):
 
 An upstream-relayed empty response is exactly "nothing durable".
 
+### Report #9352: the rule matched the client's own sentence
+
+The second report reaches the same place from the other side of the classifier —
+a rule *did* match, but its only evidence was a number the HTTP client had
+written about itself.
+
+A gateway answered `400` with an **empty body**. The HTTP client surfaced its own
+sentence for that — `400 status code (no body)`; the Anthropic and OpenAI SDKs
+share `APIError.makeMessage`, which writes exactly that when it has a status and
+no body — and `classifyPiAiError`'s rule for the number (`/\b400\b|invalid.?request/i`)
+matched the status **inside the client's own sentence**. The turn was reported as
+`INVALID_REQUEST`:
+
+```
+assistant/attempt … "failure":{"message":"400 status code (no body)","code":"INVALID_REQUEST"}
+```
+
+`INVALID_REQUEST` is in no retryable table, and **no recovery path watches it
+either** — compaction keys on `CONTEXT_WINDOW_EXCEEDED` alone. So every later
+turn re-sent the same transcript, reached the same gateway state and failed at
+step 1: a twelve-minute provider blip bricked the session. The reporter replayed
+the identical request afterwards — 898 messages, 27 tools, 2.26 MB — and the
+gateway answered **200 twice**, with a prompt-token count 0.07 % off the
+original. The request was never invalid.
+
+`INVALID_REQUEST` here is not a name for what happened; it is a name for the one
+word the client managed to write. That is the same missing evidence as #8321, and
+it deserves the same treatment: repeat the step a bounded number of times.
+
 ---
 
 ## What this plugin does
@@ -101,16 +144,57 @@ accepts the step on its own, unchanged code gate.
   code: 'EMPTY_RESPONSE', message: 'Provider returned an empty response' } } }
 ```
 
+The same rewrite handles the second report:
+
+```ts
+// before — the client's sentence, and a code that names only the client
+{ type: 'finish', reason: { kind: 'error', failure: {
+  code: 'INVALID_REQUEST', message: '400 status code (no body)' } } }
+
+// …and after
+{ type: 'finish', reason: { kind: 'error', failure: {
+  code: 'EMPTY_RESPONSE', message: '400 status code (no body)' } } }
+```
+
 Only the code changes. The provider's message, `status` and
 `providerRetryAfterMs` are carried through untouched, because the session log is
 where a maintainer reads what the provider said and the code is the only field
 the policy reads.
 
-This is the **structural** fix the report preferred over adding one more regex to
-a chain with a four-report history (#4361, #6595, #7691, #8321), every one of
-which enumerated a new wording. It is at the layer that actually knows how much
-was produced, and it is wording-independent in both directions: it neither
-promises to recognize a phrase nor depends on recognizing one.
+"Unattributed" has two shapes, and they are one principle — *a code chosen
+without a provider-authored diagnosis*:
+
+1. **`PI_AI_ERROR`** — the adapter's catch-all. No rule matched the provider's
+   text at all. This is `codes`, for report #8321.
+2. **`INVALID_REQUEST` reached from the client's own bodyless status line.** A
+   rule matched, but its only evidence was the status the *client* wrote. This is
+   `statusOnlyCodes`, for report #9352, gated on the message by
+   `statusOnlyMessages`: a `400` that carries the provider's words carries a
+   diagnosis, and is left exactly as it is.
+
+This is the **structural** fix both reports preferred over adding one more regex
+to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352), every
+one of which enumerated a new wording. It is at the layer that actually knows how
+much was produced, and it is wording-independent in the sense that matters: it
+never asks *what the provider said*, only *whether anyone said anything*.
+
+For the second recognition the message gate is unavoidable — `INVALID_REQUEST` is
+also the correct code for a genuine malformed request, and only the message can
+tell the two apart. The gate fails in the safe direction: any wording other than
+the client's own bodyless sentence declines, and declining leaves today's
+behaviour exactly as it is.
+
+**What it cannot do, and does not pretend to.** Report #9352 also asks for the
+HTTP status, headers and a body snippet to be persisted, and for a cheap recovery
+after repeated identical failures. Neither is reachable from a plugin:
+`mapStopReason` puts only `message` and `code` on the failure, so the status is
+gone before any listener sees it, and compaction is core's. What this plugin
+contributes is the first ask — an unclassifiable bodyless 4xx is repeated a
+bounded number of times instead of ending the turn. For the one provider whose
+bodyless `400`/`413` is *known* to mean context overflow (Cerebras, in pi-ai's
+`isContextOverflow`), the decision is made upstream of `classifyPiAiError`, so the
+failure arrives here already reported as `CONTEXT_WINDOW_EXCEEDED` and is not this
+plugin's to touch.
 
 ---
 
@@ -147,10 +231,17 @@ producer in the same voice is caught by the suite rather than in the field.
   predicate, which answers a different question — what a transcript reader sees —
   and therefore treats Tool calls as protocol rather than content. A Tool call is
   durable, so a durability test must not ignore it.
-- **The failure is one the adapter named.** `AUTH`, `INVALID_REQUEST`,
-  `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA` and the rest are
-  somebody else's to recover from. Only codes listed in `codes` (default: the
-  catch-all) are touched.
+- **The failure is one the adapter named from something the provider said.**
+  `AUTH`, `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`,
+  `RATE_LIMIT` and the rest are somebody else's to recover from. Only codes
+  listed in `codes` (default: the catch-all `PI_AI_ERROR` alone) or in
+  `statusOnlyCodes` (default: `INVALID_REQUEST` alone, and only in its bodyless
+  status-line form) are touched.
+- **A `400` that carries the provider's words.** `INVALID_REQUEST` is the one
+  *named* code this plugin will widen, and only when the message is nothing but
+  the HTTP client's own bodyless status line. A `400` with a body — the provider
+  telling you *why* — is a diagnosis, and is left exactly as the adapter wrote
+  it. As with everything else here, the gate fails toward today's behaviour.
 - **A cancellation.** An `aborted` finish is the caller's decision, not a
   provider failure.
 - **A success.** A `stop`, `max-tokens` or `tool-calls` finish is never touched.
@@ -185,9 +276,14 @@ code, and the provider's message.
 | key | default | meaning |
 |---|---|---|
 | `mode` | `'error'` | `'error'` rewrites the finish; `'warn'` only logs; `'off'` forwards everything unchanged. |
-| `codes` | `['PI_AI_ERROR']` | Failure codes whose zero-output attempts are widened. |
+| `codes` | `['PI_AI_ERROR']` | Failure codes whose zero-output attempts are widened unconditionally — the adapter's catch-alls. |
+| `statusOnlyCodes` | `['INVALID_REQUEST']` | Failure codes widened **only** when the message is the HTTP client's own bodyless status line. |
+| `statusOnlyMessages` | the client's `… status code (no body)` sentence, and an empty JSON container | Regular-expression sources; a failure whose code is in `statusOnlyCodes` is widened only when its message matches one. Anchored at the end of the message. |
 | `exceptMessages` | `['^pi-ai ']` | Regular-expression sources; a failure whose message matches any is left exactly as the adapter wrote it. |
 | `targetCode` | `'EMPTY_RESPONSE'` | Code written on a widened finish. |
+
+A code listed in both `codes` and `statusOnlyCodes` is widened unconditionally,
+as `codes` describes — there is nothing left to gate.
 
 Every field is validated at mount time and a bad value throws rather than
 silently disabling the guard.
@@ -222,7 +318,9 @@ completion.
 
 **What this does not do.** It does not change `retryableCodes`, `maxRetries` or
 backoff; those belong to each provider's `retryPolicy` and are read by
-`dsh-llm-retry`. It does not touch any code the adapter named. It does not
+`dsh-llm-retry`. It does not touch a code the adapter named from something the
+provider said; the one named code it will widen (`INVALID_REQUEST`) is gated on
+the message being nothing but the client's own bodyless status line. It does not
 patch, wrap or monkey-patch the adapter — it is a listener on a documented
 waterfall, so removing the plugin restores the previous behaviour exactly.
 

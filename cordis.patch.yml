@@ -25,13 +25,32 @@
 # right: "The attempt produced nothing durable, so retry policy treats it as safe
 # to repeat."
 #
+# Discussion #9352 reaches the same missing evidence from the other side of the
+# classifier. A gateway answered `400` with an EMPTY body; the HTTP client wrote
+# its own sentence for that (`400 status code (no body)` — the Anthropic and
+# OpenAI SDKs share `APIError.makeMessage`), and `classifyPiAiError`'s rule for
+# the number, `/\b400\b|invalid.?request/i`, matched the status inside the
+# client's own sentence. So the turn was reported as INVALID_REQUEST:
+#
+#   "failure":{"message":"400 status code (no body)","code":"INVALID_REQUEST"}
+#
+# `INVALID_REQUEST` is in no retryable table, and no recovery path watches it
+# (compaction keys on `CONTEXT_WINDOW_EXCEEDED` alone), so every later turn
+# re-sent the same transcript, hit the same gateway state and failed at step 1 —
+# a twelve-minute provider blip bricked the session. The reporter replayed the
+# identical request afterwards and the gateway answered 200 twice.
+#
 # This plugin observes the public `llm/stream` waterfall — the one seam that sees
 # an attempt AND everything it produced — and rewrites that finish's
 # `failure.code` to the by-value `EMPTY_RESPONSE` when the attempt
 #   * ended in an error, and
 #   * produced nothing at all (no block, no non-empty token delta, no Tool call),
 #   * with a code listed in `codes` (default: the catch-all `PI_AI_ERROR` alone),
-#   * whose message is not the adapter's own (`exceptMessages`, default `^pi-ai `).
+#     whose message is not the adapter's own (`exceptMessages`, default `^pi-ai `), or
+#   * with a code listed in `statusOnlyCodes` (default `INVALID_REQUEST`) whose
+#     message is ONLY the HTTP client's own bodyless status line
+#     (`statusOnlyMessages`) — a `400` that carries the provider's words is a
+#     diagnosis and is left exactly as the adapter wrote it.
 #
 # The retry executor then accepts the step on its own unchanged code gate. Only
 # the code changes: the provider's message, status and `providerRetryAfterMs` are

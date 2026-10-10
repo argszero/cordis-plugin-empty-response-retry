@@ -57,21 +57,73 @@
  * > The attempt produced nothing durable, so retry policy treats it as safe to
  * > repeat.
  *
+ * ## The second report (discussion #9352)
+ *
+ * The same missing evidence, reached from the other side of the classifier.
+ *
+ * A gateway answered `400` with an **empty body**. The HTTP client surfaced its
+ * own sentence for that — `400 status code (no body)`; the Anthropic and OpenAI
+ * SDKs share `APIError.makeMessage`, which writes exactly that when it has a
+ * status and no body — and `classifyPiAiError`'s rule for the number,
+ * `/\b400\b|invalid.?request/i`, matched the status **inside the client's own
+ * sentence**. So the failure was reported as `INVALID_REQUEST`: not a name for
+ * what happened, but a name for the one word the client had managed to write.
+ *
+ * `INVALID_REQUEST` is in no retryable table, and no recovery path watches it
+ * either — compaction keys on `CONTEXT_WINDOW_EXCEEDED` alone. Every later turn
+ * re-sent the same transcript, reached the same gateway state and failed at step
+ * 1, so a twelve-minute provider blip bricked the session (#9352):
+ *
+ * ```
+ * assistant/attempt … "failure":{"message":"400 status code (no body)","code":"INVALID_REQUEST"}
+ * ```
+ *
+ * The reporter replayed the identical request afterwards — 898 messages, 27
+ * tools, 2.26 MB — and got HTTP 200 twice, with a prompt-token count 0.07% off
+ * the original. The request was never invalid.
+ *
  * ## What this plugin does
  *
  * It wraps the public `llm/stream` waterfall — the one seam that sees an attempt
- * *and* everything it produced — and, when an attempt ended in an unattributed
- * error **and produced nothing at all**, rewrites the finish's `failure.code` to
- * the by-value `EMPTY_RESPONSE`. The retry executor then accepts the step on its
- * own, unchanged code gate. Nothing else about the failure is touched: the
- * provider's message, status and `providerRetryAfterMs` are carried through, so
- * the session log still shows what the provider said.
+ * *and* everything it produced — and, when an attempt ended in an error the
+ * adapter could not attribute **and produced nothing at all**, rewrites the
+ * finish's `failure.code` to the by-value `EMPTY_RESPONSE`. The retry executor
+ * then accepts the step on its own, unchanged code gate, which is bounded by the
+ * route's own `maxRetries` and backoff. Nothing else about the failure is
+ * touched: the provider's message, status and `providerRetryAfterMs` are carried
+ * through, so the session log still shows what the provider said.
  *
- * This is the structural fix the reporter preferred over adding one more regex to
- * a chain with a four-report history (#4361, #6595, #7691, and #8321) — every one
- * of which enumerated a new wording. It is also strictly *narrower* than the
- * `retryableCodes: [..., PI_AI_ERROR]` workaround in the same report, which
- * widens every `PI_AI_ERROR` on a route; see the next section.
+ * "Could not attribute" has two shapes, and they are one principle — *a code
+ * chosen without a provider-authored diagnosis*:
+ *
+ * 1. `PI_AI_ERROR`, the adapter's catch-all: no rule matched the provider's text
+ *    at all. This is `codes` (report #8321).
+ * 2. `INVALID_REQUEST` reached from the client's own "no body" sentence: a rule
+ *    matched, but its only evidence was the HTTP status the *client* wrote. This
+ *    is `statusOnlyCodes` (report #9352), gated on the message by
+ *    `statusOnlyMessages` — a `400` that carries the provider's words is a
+ *    diagnosis, and is left exactly as it is.
+ *
+ * This is the structural fix both reporters preferred over adding one more regex
+ * to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352) —
+ * every one of which enumerated a new wording. It is also strictly *narrower*
+ * than the `retryableCodes: [..., PI_AI_ERROR]` workaround in the first report,
+ * which widens every catch-all failure on a route; see the next section.
+ *
+ * **What it cannot do, and does not pretend to.** The report also asks for the
+ * HTTP status, headers and a body snippet to be persisted, and for a cheap
+ * recovery after repeated identical failures. Neither is reachable from here:
+ * `mapStopReason` puts only `message` and `code` on the failure
+ * (`packages/llm/llm-pi-ai/src/stream.ts`), so the status is gone before any
+ * plugin sees it, and compaction is core's. What this plugin contributes is the
+ * first ask — an unclassifiable 4xx is repeated a bounded number of times
+ * instead of ending the turn.
+ *
+ * Nor can it swallow an overflow diagnosis: for the one provider whose bodyless
+ * `400`/`413` is *known* to mean context overflow (Cerebras, in pi-ai's
+ * `isContextOverflow`), that decision is made upstream of `classifyPiAiError`,
+ * so the failure arrives here already reported as `CONTEXT_WINDOW_EXCEEDED` and
+ * is not this plugin's to touch.
  *
  * ## What it refuses
  *
@@ -105,10 +157,21 @@
  *   tool call is durable, so a durability test must not ignore it.
  * - **The finish is not an error**, or is already `EMPTY_RESPONSE`, or is
  *   `aborted` (a caller cancellation is not a provider failure).
- * - **The code is not in `codes`** (default: the pi-ai catch-all alone). A
- *   failure the adapter *did* name — `AUTH`, `INVALID_REQUEST`,
- *   `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA` — is somebody
- *   else's to recover from, and is left alone.
+ * - **The code is not in `codes` or `statusOnlyCodes`.** A failure the adapter
+ *   named from something the provider actually said — `AUTH`,
+ *   `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`, `RATE_LIMIT` — is
+ *   somebody else's to recover from, and is left alone. `INVALID_REQUEST` is the
+ *   one named code this plugin will touch, and only in its status-only form: a
+ *   message carrying anything else, even two words, is a diagnosis and is
+ *   declined.
+ * - **A status-only message is only widened when it is status-only.** The gate
+ *   is the message (`statusOnlyMessages`), not the code, so a `400` that carries
+ *   a body — the provider telling you *why* — keeps the code the adapter chose.
+ *   The default patterns are anchored at the end of the message, because when
+ *   pi-ai writes a provider prefix it comes first
+ *   (`OpenAI API error (400): 400 status code (no body)`). They fail in the safe
+ *   direction: an unreadable body this plugin does not recognize leaves today's
+ *   behaviour exactly as it is.
  *
  * The guard is streaming-preserving: every chunk is yielded the moment it
  * arrives, at most the last one is rewritten, and the only state it keeps is one
@@ -145,6 +208,53 @@ export const DEFAULT_MODE = 'error'
  * the adapter already made.
  */
 export const DEFAULT_CODES: readonly string[] = Object.freeze(['PI_AI_ERROR'])
+
+/**
+ * Default codes widened **only** when the failure's message is the HTTP client's
+ * own sentence about a bodyless response.
+ *
+ * `INVALID_REQUEST` is what `classifyPiAiError` reports for `400` and `413`, and
+ * the rule behind it (`/\b400\b|invalid.?request/i`) matches the status number
+ * wherever it appears — including inside the sentence an HTTP client writes when
+ * it has a status and no body at all (`400 status code (no body)`; the Anthropic
+ * and OpenAI SDKs share `APIError.makeMessage`). When that is the whole of the
+ * evidence, the code names the *client's* inability to read the response, not a
+ * defect in the request: report #9352 replayed the identical request afterwards
+ * and the gateway answered 200 twice.
+ *
+ * It is admitted here and nowhere else. Any other message keeps the code the
+ * adapter chose, because a `400` that carries the provider's words carries a
+ * diagnosis, and repeating it would be this plugin overriding the one thing the
+ * provider explained.
+ */
+export const DEFAULT_STATUS_ONLY_CODES: readonly string[] = Object.freeze(['INVALID_REQUEST'])
+
+/**
+ * Default test for the status-only message: the client's own sentence, and
+ * nothing else.
+ *
+ * Two shapes, both consequences of pi-ai's normalization of provider errors
+ * (`@earendil-works/pi-ai/dist/utils/error-body.js`), which surfaces a body
+ * whenever it has one — so the absence of a body is visible as the absence of
+ * any text in the message:
+ *
+ * 1. the status sentence such a client writes itself — `400 status code (no
+ *    body)`. Anchored at the *end* rather than the start, because when pi-ai
+ *    writes a provider prefix it comes first (`OpenAI API error (400): 400
+ *    status code (no body)`), and because a body would have been appended
+ *    instead of this sentence;
+ * 2. a body that deserialized to an empty container (`400 {}`), which pi-ai's
+ *    own `normalizeProviderError` already treats as no body at all
+ *    (`isPlainNonEmptyObject`).
+ *
+ * Both fail in the safe direction: any other wording, including a bodyless
+ * sentence from a client this plugin has not seen, declines — and declining
+ * leaves exactly today's behaviour.
+ */
+export const DEFAULT_STATUS_ONLY_MESSAGES: readonly string[] = Object.freeze([
+  '\\b\\d{3}\\s+status\\s+code\\s+\\(no body\\)$',
+  '\\b\\d{3}\\s+(?:\\{\\}|\\[\\])$',
+])
 
 /** Default code written on a widened finish: the harness's own by-value constant. */
 export const DEFAULT_TARGET_CODE = EMPTY_RESPONSE_CODE
@@ -183,6 +293,22 @@ export interface Config {
    */
   codes?: string[]
   /**
+   * Failure codes widened only when the failure's message is the HTTP client's
+   * own sentence about a bodyless response. Defaults to `['INVALID_REQUEST']`,
+   * which is where a bare `400` (and `413`) status line lands. Every other
+   * message with one of these codes is left alone. A code listed here *and* in
+   * `codes` is widened unconditionally, as `codes` describes.
+   */
+  statusOnlyCodes?: string[]
+  /**
+   * Regular-expression sources; a code listed in `statusOnlyCodes` is widened
+   * only when the failure's message matches one of them. Defaults to the
+   * client's own `… status code (no body)` sentence and to an empty JSON
+   * container — see {@link DEFAULT_STATUS_ONLY_MESSAGES}. Patterns are anchored
+   * where the message ends, not where it begins.
+   */
+  statusOnlyMessages?: string[]
+  /**
    * Regular-expression sources; a failure whose message matches any of them is
    * left exactly as the adapter wrote it. Defaults to `['^pi-ai ']` — the
    * adapter's own deliberate terminal states.
@@ -199,14 +325,25 @@ export interface Config {
 export interface ResolvedConfig {
   readonly mode: GuardMode
   readonly codes: readonly string[]
+  readonly statusOnlyCodes: readonly string[]
+  readonly statusOnlyMessages: readonly RegExp[]
   readonly exceptMessages: readonly RegExp[]
   readonly targetCode: string
 }
+
+/** Why a failure's code was admitted: which of the two recognitions fired. */
+export type WidenBasis =
+  /** `codes`: the adapter's catch-all — no rule matched the provider's text. */
+  | 'catch-all'
+  /** `statusOnlyCodes`: the rule matched only the client's bodyless status line. */
+  | 'status-only'
 
 /** One recognition, as it is logged. */
 export interface WidenEvidence {
   /** The code the adapter chose. */
   readonly code: string
+  /** Which recognition admitted it. */
+  readonly basis: WidenBasis
   /** The provider or adapter message, verbatim. */
   readonly message: string
   /** The code the finish was rewritten to. */
@@ -233,6 +370,27 @@ function stringList(label: string, value: readonly string[] | undefined, fallbac
 }
 
 /**
+ * Compile one list of regular-expression sources, naming the field on failure.
+ *
+ * A pattern that does not compile must stop the mount rather than leave the
+ * guard acting on a list it silently truncated: as with every other field here,
+ * a broken config has to look like a broken config, not like the bug.
+ * @param label - the config field, as the operator wrote it.
+ * @param value - the sources the operator passed, if any.
+ * @param fallback - the shipped default.
+ * @returns the compiled patterns, in order.
+ */
+function patternList(label: string, value: readonly string[] | undefined, fallback: readonly string[]): readonly RegExp[] {
+  return Object.freeze(stringList(label, value, fallback).map((source) => {
+    try {
+      return new RegExp(source)
+    } catch (error) {
+      throw new Error(`empty-response-retry: \`${label}\` entry ${JSON.stringify(source)} is not a valid regular expression`, { cause: error })
+    }
+  }))
+}
+
+/**
  * Validate, default and compile one plugin config.
  *
  * Fail-loud on every field: a config typo that silently disabled the guard would
@@ -246,22 +404,18 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     throw new Error(`empty-response-retry: \`mode\` must be "error", "warn" or "off" (got ${JSON.stringify(mode)})`)
   }
   const codes = stringList('codes', config.codes, DEFAULT_CODES)
+  const statusOnlyCodes = stringList('statusOnlyCodes', config.statusOnlyCodes, DEFAULT_STATUS_ONLY_CODES)
   const targetCode = config.targetCode ?? DEFAULT_TARGET_CODE
   if (typeof targetCode !== 'string' || targetCode.length === 0) {
     throw new Error('empty-response-retry: `targetCode` must be a non-empty string')
   }
-  const sources = stringList('exceptMessages', config.exceptMessages, DEFAULT_EXCEPT_MESSAGES)
   return Object.freeze({
     mode,
     codes,
+    statusOnlyCodes,
     targetCode,
-    exceptMessages: Object.freeze(sources.map((source) => {
-      try {
-        return new RegExp(source)
-      } catch (error) {
-        throw new Error(`empty-response-retry: \`exceptMessages\` entry ${JSON.stringify(source)} is not a valid regular expression`, { cause: error })
-      }
-    })),
+    statusOnlyMessages: patternList('statusOnlyMessages', config.statusOnlyMessages, DEFAULT_STATUS_ONLY_MESSAGES),
+    exceptMessages: patternList('exceptMessages', config.exceptMessages, DEFAULT_EXCEPT_MESSAGES),
   })
 }
 
@@ -295,7 +449,35 @@ export function chunkCarriesContent(chunk: StreamChunk): boolean {
 }
 
 /**
+ * Decide why one failure's code is admitted, or that it is not.
+ *
+ * The two recognitions this plugin has, in the order they are checked:
+ *
+ * - `codes` (default the adapter's catch-all) is admitted unconditionally: the
+ *   adapter could not name the failure, so its code carries no diagnosis to
+ *   contradict.
+ * - `statusOnlyCodes` (default `INVALID_REQUEST`) is admitted only when the
+ *   message is nothing but the HTTP status the *client* wrote. The code is a
+ *   name for the client's inability to read the response, not for anything the
+ *   provider said, so the failure is as unattributed as the catch-all is.
+ *
+ * A code in both lists is admitted the first way; there is nothing to gate.
+ * @param failure - the failure the adapter produced.
+ * @param config - the resolved config.
+ * @returns which recognition admitted it, or `null` to leave the finish alone.
+ */
+export function widenBasis(failure: LlmFailure, config: ResolvedConfig): WidenBasis | null {
+  if (config.codes.includes(failure.code)) return 'catch-all'
+  if (!config.statusOnlyCodes.includes(failure.code)) return null
+  return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? 'status-only' : null
+}
+
+/**
  * Decide whether one terminal reason is an unattributed empty attempt.
+ *
+ * The order of the refusals is deliberate: what the attempt *produced* is
+ * checked before what the failure says, because a retry that could duplicate
+ * durable output is wrong whatever the code is.
  * @param reason - the finish reason the adapter produced.
  * @param producedContent - whether the attempt emitted any content-bearing chunk.
  * @param config - the resolved config.
@@ -310,7 +492,7 @@ export function classifyEmptyAttempt(
   if (reason.kind !== 'error') return null
   const failure = reason.failure
   if (producedContent) return null
-  if (!config.codes.includes(failure.code)) return null
+  if (widenBasis(failure, config) === null) return null
   if (failure.code === config.targetCode) return null
   if (config.exceptMessages.some((pattern) => pattern.test(failure.message))) return null
   return { ...failure, code: config.targetCode }
@@ -347,7 +529,7 @@ export function rewriteFinish(
  * @param onWiden - called once per recognized finish, including in `warn` mode.
  *   Kept as a parameter so the generator stays pure and log-free for tests; the
  *   plugin passes a `ctx.logger.warn` delegate.
- * @returns the stream, with an unattributed empty attempt reported as
+ * @returns the stream, with an unclassifiable empty attempt reported as
  *   `EMPTY_RESPONSE`.
  */
 export async function* guardEmptyResponseStream(
@@ -364,19 +546,24 @@ export async function* guardEmptyResponseStream(
   let producedContent = false
 
   for await (const chunk of source) {
-    if (chunk.type === 'finish') {
-      const failure = classifyEmptyAttempt(chunk.reason, producedContent, config)
-      if (failure !== null) {
+    if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
+      const { failure } = chunk.reason
+      const basis = widenBasis(failure, config)
+      // `classifyEmptyAttempt` reaches the same verdict through the same helper,
+      // so asking again for the log line cannot disagree with the decision.
+      const widened = basis === null ? null : classifyEmptyAttempt(chunk.reason, producedContent, config)
+      if (widened !== null && basis !== null) {
         onWiden?.({
-          code: chunk.reason.kind === 'error' ? chunk.reason.failure.code : '',
-          message: failure.message,
+          code: failure.code,
+          basis,
+          message: widened.message,
           targetCode: config.targetCode,
           provider: route.provider,
           model: route.model,
           verdict: config.mode,
         })
         if (config.mode === 'error') {
-          yield rewriteFinish(chunk, failure)
+          yield rewriteFinish(chunk, widened)
           continue
         }
       }
@@ -408,11 +595,14 @@ export function apply(ctx: Context, config: Config = {}): void {
       { provider: options.provider, model: options.model },
       (evidence) => {
         ctx.logger.warn(
-          'empty-response-retry: %s/%s failed as %s with no content produced ("%s"); %s (discussion #8321)',
+          'empty-response-retry: %s/%s failed as %s with no content produced ("%s") — %s; %s (discussions #8321, #9352)',
           evidence.provider,
           evidence.model,
           evidence.code,
           evidence.message,
+          evidence.basis === 'catch-all'
+            ? 'the adapter named no cause'
+            : 'named from the HTTP status line alone, with no provider body to read',
           evidence.verdict === 'error'
             ? `reported as ${evidence.targetCode} so the retry policy can repeat the attempt`
             : 'left unchanged (warn mode)',

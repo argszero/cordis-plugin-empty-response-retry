@@ -27,7 +27,7 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import * as LlmRetry from '@deepseek-ai/dsh-llm-retry'
 
 import * as plugin from '../lib/index.js'
-import { REPORTED_EMPTY_TURN, ROUTE, ScriptedAdapter, drain, streamOnce } from './harness.mjs'
+import { REPORTED_EMPTY_TURN, REPORTED_STATUS_ONLY_TURN, ROUTE, ScriptedAdapter, drain, observedMessage, streamOnce } from './harness.mjs'
 
 /**
  * The shipped defaults, with the wait shortened.
@@ -38,7 +38,7 @@ import { REPORTED_EMPTY_TURN, ROUTE, ScriptedAdapter, drain, streamOnce } from '
 const FAST_DEFAULT_POLICY = { mode: 'normal', backoff: { initialDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 } }
 
 /** Mount the pieces the retry hop needs; `mountGuard = false` is a control arm. */
-async function recoveryWorld(mountGuard = true) {
+async function recoveryWorld(mountGuard = true, chunks = REPORTED_EMPTY_TURN) {
   const ctx = new Context()
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
@@ -51,7 +51,7 @@ async function recoveryWorld(mountGuard = true) {
   if (mountGuard) {
     await ctx.plugin({ name: plugin.name, apply: (c) => { plugin.apply(c) }, inject: plugin.inject })
   }
-  ctx.llm.registerAdapter([ROUTE.provider], new ScriptedAdapter(REPORTED_EMPTY_TURN))
+  ctx.llm.registerAdapter([ROUTE.provider], new ScriptedAdapter(chunks))
   const session = ctx.sessions.create()
   assert.ok(ctx.sessionProjections !== undefined, 'the real projection registry must be mounted')
   return { ctx, session }
@@ -118,6 +118,45 @@ test('control: a code nobody registered is also passed through', async () => {
   const { ctx, session } = await recoveryWorld(true)
   const action = await dispatch(ctx, { session, failure: { code: 'UNHEARD_OF', message: 'x' } })
   assert.equal(action, undefined)
+  assert.deepEqual(eventTypes(session), [])
+})
+
+/* ------------------------------------------------------------------ *
+ * the second report (#9352) through the same real executor
+ * ------------------------------------------------------------------ */
+
+test('the reported 400-with-no-body is retried by the real executor, and written down', async () => {
+  const { ctx, session } = await recoveryWorld(true, REPORTED_STATUS_ONLY_TURN)
+  const failure = await failureOf(ctx)
+  assert.equal(failure.code, EMPTY_RESPONSE_CODE)
+  // The client's sentence survives the rewrite, which is the only diagnostic the
+  // adapter kept (#9352, ask 3).
+  assert.equal(failure.message, '400 status code (no body)')
+
+  assert.deepEqual(await dispatch(ctx, { session, failure }), { kind: 'retry' })
+  assert.deepEqual(eventTypes(session), ['llm/retry', 'llm/retry-started'])
+  assert.equal(session.snapshotEvents()[0].data.failure.message, '400 status code (no body)')
+})
+
+test('control: unmounted, the same turn is never retried — the report’s permanent lock', async () => {
+  const { ctx, session } = await recoveryWorld(false, REPORTED_STATUS_ONLY_TURN)
+  const failure = await failureOf(ctx)
+  assert.equal(failure.code, 'INVALID_REQUEST')
+
+  assert.equal(await dispatch(ctx, { session, failure }), undefined)
+  assert.deepEqual(eventTypes(session), [])
+})
+
+test('control: a 400 that carries the provider’s words is not retried either', async () => {
+  // The gate end to end: the plugin declines, so the executor never sees a code
+  // it would accept, and the provider's own explanation stands.
+  const withBody = [
+    { type: 'finish', reason: { kind: 'error', failure: { code: 'INVALID_REQUEST', message: observedMessage('anthropic', 400, { message: 'upstream blip' }) } } },
+  ]
+  const { ctx, session } = await recoveryWorld(true, withBody)
+  const failure = await failureOf(ctx)
+  assert.equal(failure.code, 'INVALID_REQUEST')
+  assert.equal(await dispatch(ctx, { session, failure }), undefined)
   assert.deepEqual(eventTypes(session), [])
 })
 

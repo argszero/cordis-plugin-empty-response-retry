@@ -17,7 +17,66 @@ import * as plugin from '../lib/index.js'
 /** The route the report used: pi-ai behind OpenRouter, `api: openai-completions`. */
 export const ROUTE = { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' }
 
-/** The reported turn: usage first, then the terminal finish, as `toStreamChunks` emits it. */
+/*
+ * The installed clients, resolved from the tree this package is tested in rather
+ * than declared in its manifest. Declaring a range here would install a second
+ * copy of `@earendil-works/pi-ai` beside the one the adapter runs, and a witness
+ * of the wrong copy is worse than none. `import.meta.resolve` follows the tree
+ * npm actually built, which is the one under test.
+ */
+const { APIError: AnthropicApiError } = await import(import.meta.resolve('@anthropic-ai/sdk'))
+const { APIError: OpenAiApiError } = await import(import.meta.resolve('openai'))
+const { formatProviderError, normalizeProviderError } = await import(import.meta.resolve('@earendil-works/pi-ai/utils/error-body'))
+
+/**
+ * A provider HTTP error as an HTTP client constructs it.
+ * @param client - which installed SDK to construct it with.
+ * @param status - the status the client received.
+ * @param body - the deserialized body, or `undefined` when the client could read none.
+ */
+export function providerError(client, status, body) {
+  const Client = client === 'openai' ? OpenAiApiError : AnthropicApiError
+  return new Client(status, body, undefined, undefined)
+}
+
+/**
+ * The sentence an installed HTTP client writes for a status it received.
+ *
+ * `APIError.makeMessage` is shared by both clients (`${status} status code (no
+ * body)` when there is a status and no message), and it is the *last* thing that
+ * touches the text on the Anthropic-messages route, where the adapter assigns
+ * `error.message` to `errorMessage` verbatim.
+ * @param client - which installed SDK models the client.
+ * @param status - the status the client received.
+ * @returns the message the client's own error carries.
+ */
+export function clientSentence(client, status) {
+  const Client = client === 'openai' ? OpenAiApiError : AnthropicApiError
+  return Client.makeMessage(status, undefined, undefined)
+}
+
+/**
+ * What the *installed* stack puts in `errorMessage` for a provider HTTP error.
+ *
+ * The chain is the adapter's: the HTTP client composes its own sentence
+ * (`APIError.makeMessage` — `${status} status code (no body)` when it has a
+ * status and no body), then pi-ai's `normalizeProviderError` /
+ * `formatProviderError` surface a body if there is one and leave the sentence
+ * alone if there is not. The result is what `classifyPiAiError` is handed, so it
+ * is the only honest source for the fixtures below.
+ * @param client - which installed SDK models the client.
+ * @param status - the status the client received.
+ * @param body - the deserialized body, or `undefined` when the client could read none.
+ * @param prefix - pi-ai's provider prefix, when the route's API layer writes one.
+ * @returns the message the harness would classify.
+ */
+export function observedMessage(client, status, body, prefix) {
+  return formatProviderError(normalizeProviderError(providerError(client, status, body)), prefix)
+}
+
+/**
+ * The reported turn: usage first, then the terminal finish, as `toStreamChunks` emits it.
+ */
 export const REPORTED_EMPTY_TURN = [
   { type: 'usage', usage: { inputTokens: 11, outputTokens: 0, totalTokens: 11 } },
   {
@@ -25,6 +84,30 @@ export const REPORTED_EMPTY_TURN = [
     reason: {
       kind: 'error',
       failure: { message: 'Provider returned an empty response', code: 'PI_AI_ERROR' },
+    },
+  },
+]
+
+/**
+ * The second reported turn (discussion #9352): a gateway answered `400` with an
+ * empty body, the client wrote its own sentence for that, and the classifier's
+ * `400` rule matched the status number inside it — so the failure is reported
+ * under a *named* code that names nothing the provider said.
+ *
+ * Both strings are produced by the installed stack (see {@link observedMessage}),
+ * not transcribed; `test/packaging.spec.mjs` re-derives them and executes the
+ * adapter's own classifier to confirm the code.
+ */
+export const REPORTED_STATUS_ONLY_TURN = [
+  { type: 'usage', usage: { inputTokens: 660000, outputTokens: 0, totalTokens: 660000 } },
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        message: observedMessage('anthropic', 400, undefined),
+        code: 'INVALID_REQUEST',
+      },
     },
   },
 ]

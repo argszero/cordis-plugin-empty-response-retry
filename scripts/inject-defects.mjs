@@ -57,8 +57,8 @@ const MUTATIONS = [
   {
     name: 'the code gate is dropped, so a failure the adapter named is repeated',
     file: 'src/index.ts',
-    find: '  if (!config.codes.includes(failure.code)) return null\n',
-    replace: '',
+    find: "  if (config.codes.includes(failure.code)) return 'catch-all'\n",
+    replace: "  if (failure.code !== config.targetCode) return 'catch-all'\n",
     caughtBy: 'a code the adapter did name',
   },
   {
@@ -97,10 +97,24 @@ const MUTATIONS = [
     caughtBy: 'codes chooses which catch-alls are widened (the narrowed arm)',
   },
   {
+    name: 'the status-only code gate is dropped, so a bodyless 401 is repeated too',
+    file: 'src/index.ts',
+    find: '  if (!config.statusOnlyCodes.includes(failure.code)) return null\n  return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? \'status-only\' : null\n',
+    replace: '  return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? \'status-only\' : null\n',
+    caughtBy: 'a bodyless 413 status line is the same recognition, and a bodyless 401 is not',
+  },
+  {
+    name: 'the status-only message gate is dropped, so a provider\u2019s own 400 is overwritten',
+    file: 'src/index.ts',
+    find: "  return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? 'status-only' : null\n",
+    replace: "  return 'status-only'\n",
+    caughtBy: 'a 400 that carries the provider\u2019s own words keeps its code',
+  },
+  {
     name: 'warn mode rewrites anyway, so measuring before enabling is impossible',
     file: 'src/index.ts',
-    find: "        if (config.mode === 'error') {\n          yield rewriteFinish(chunk, failure)\n          continue\n        }",
-    replace: '        yield rewriteFinish(chunk, failure)\n        continue',
+    find: "        if (config.mode === 'error') {\n          yield rewriteFinish(chunk, widened)\n          continue\n        }",
+    replace: '        yield rewriteFinish(chunk, widened)\n        continue',
     caughtBy: 'warn mode reports the recognition and leaves the stream alone',
   },
   {

@@ -22,7 +22,8 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import semver from 'semver'
 
-import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_TARGET_CODE, resolveConfig } from '../lib/index.js'
+import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, resolveConfig } from '../lib/index.js'
+import { REPORTED_STATUS_ONLY_TURN, clientSentence, observedMessage } from './harness.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
@@ -166,7 +167,9 @@ test('every manifest entry point is in the tarball, and the patch names this plu
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml', 'the bundle patch declaration points at the shipped file')
   const patch = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8')
   assert.ok(patch.includes(manifest.name), 'the bundle patch must mount this package by name')
-  assert.ok(patch.includes('#8321'), 'the bundle patch must name the report it answers')
+  for (const report of ['#8321', '#9352']) {
+    assert.ok(patch.includes(report), `the bundle patch must name the report it answers: ${report} missing`)
+  }
 })
 
 test('the installed adapter still writes the sentences this plugin transcribes', () => {
@@ -208,7 +211,119 @@ test('the default exclusion covers every message the installed adapter authors f
 test('the shipped defaults are the ones the report asks for', () => {
   const resolved = resolveConfig()
   assert.deepEqual([...resolved.codes], [...DEFAULT_CODES])
+  assert.deepEqual([...resolved.statusOnlyCodes], [...DEFAULT_STATUS_ONLY_CODES])
   assert.equal(resolved.targetCode, DEFAULT_TARGET_CODE)
   assert.ok(resolved.codes.includes('PI_AI_ERROR'), 'the pi-ai catch-all is the code this plugin exists for')
+  assert.ok(resolved.statusOnlyCodes.includes('INVALID_REQUEST'), 'a bare 400 status line is the code the second report is about')
   assert.ok(!resolved.codes.includes(resolved.targetCode), 'the target code is never a source code')
+  assert.ok(!resolved.statusOnlyCodes.includes(resolved.targetCode), 'the target code is never a gated source code either')
+})
+
+/* ------------------------------------------------------------------ *
+ * the gate, checked against the clients and the classifier that produce it
+ * (discussion #9352)
+ * ------------------------------------------------------------------ */
+
+/** The statuses this plugin's gate can be reached from, one per classifier rule. */
+const STATUS_LINES = [400, 401, 403, 404, 413, 429, 500]
+
+test('both installed HTTP clients write the sentence the gate targets', () => {
+  for (const client of ['anthropic', 'openai']) {
+    for (const status of STATUS_LINES) {
+      assert.equal(
+        clientSentence(client, status),
+        `${status} status code (no body)`,
+        `${client} no longer writes the bodyless sentence this plugin keys on`,
+      )
+    }
+  }
+})
+
+test('pi-ai surfaces a body and leaves a bodyless sentence alone', () => {
+  // This is why the gate can key on the message at all: after pi-ai's own
+  // normalization a body is *always* visible as text, so "no text but the
+  // status" and "the provider explained itself" cannot be confused.
+  for (const client of ['anthropic', 'openai']) {
+    assert.equal(observedMessage(client, 400, undefined), '400 status code (no body)')
+    assert.equal(observedMessage(client, 400, { message: 'upstream blip' }), '400: {"message":"upstream blip"}')
+    assert.equal(observedMessage(client, 400, {}), '400 {}')
+  }
+})
+
+test('the shipped gate decides the installed stack’s strings the way the reports need', () => {
+  const patterns = DEFAULT_STATUS_ONLY_MESSAGES.map((source) => new RegExp(source))
+  const gated = (message) => patterns.some((pattern) => pattern.test(message))
+  for (const status of STATUS_LINES) {
+    assert.ok(gated(observedMessage('anthropic', status, undefined)), `a bare ${status} status line must be recognized`)
+    // An empty container is recognized too: pi-ai's own normalizer already calls
+    // it no body, so the gate must not be narrower than the thing it tests.
+    assert.ok(gated(observedMessage('anthropic', status, {})), `an empty ${status} body is no body`)
+    // …while a body that says anything at all is not.
+    assert.ok(!gated(observedMessage('anthropic', status, { message: 'upstream blip' })))
+  }
+  // pi-ai's prefix, when a route's API layer writes one, comes first.
+  assert.ok(gated(observedMessage('openai', 400, undefined, 'OpenAI API error')))
+})
+
+/**
+ * The adapter's own classifier, extracted from the shipped bundle.
+ *
+ * The transcription in `test/harness.mjs` says a bodyless `400` arrives as
+ * `INVALID_REQUEST`; that claim is only worth something if the shipped code
+ * makes it. The function is a top-level declaration in the bundle and its only
+ * free identifiers are two exports of the harness's own code-constant module, so
+ * it can be called here with the harness's own helpers — the decision table
+ * under test is the installed one, not a copy of it.
+ */
+async function installedClassifier() {
+  const bundle = adapterBundle()
+  const start = bundle.indexOf('function classifyPiAiError(')
+  assert.ok(start > 0, 'the installed adapter no longer declares classifyPiAiError')
+  const end = bundle.indexOf('\n}\n', start)
+  assert.ok(end > start, 'the installed classifier is no longer a top-level function with its closing brace in column 0')
+  const { isQuotaExceededError, QUOTA_EXCEEDED_CODE } = await import('@deepseek-ai/dsh-llm')
+  return new Function('isQuotaExceededError', 'QUOTA_EXCEEDED_CODE', `${bundle.slice(start, end + 3)}\nreturn classifyPiAiError`)(isQuotaExceededError, QUOTA_EXCEEDED_CODE)
+}
+
+test('the installed classifier reports the installed strings the way this plugin assumes', async () => {
+  const classify = await installedClassifier()
+  // The second report's chain, link by link: the client's sentence for a 400 it
+  // could read no body from is reported as a *named*, non-retryable code.
+  assert.equal(classify(observedMessage('anthropic', 400, undefined)), 'INVALID_REQUEST')
+  assert.equal(classify(observedMessage('openai', 400, undefined, 'OpenAI API error')), 'INVALID_REQUEST')
+  assert.equal(classify(observedMessage('anthropic', 413, undefined)), 'INVALID_REQUEST')
+  // The same rule fires on a *body*, which is exactly why the gate cannot be the
+  // code alone — the code carries no diagnosis, so the message has to decide.
+  assert.equal(classify(observedMessage('anthropic', 400, { message: 'upstream blip' })), 'INVALID_REQUEST')
+  // The first report's chain, unchanged.
+  assert.equal(classify('Provider returned an empty response'), 'PI_AI_ERROR')
+  // Codes this plugin must never take over: each rule's own evidence.
+  assert.equal(classify(observedMessage('anthropic', 401, undefined)), 'AUTH')
+  assert.equal(classify(observedMessage('anthropic', 429, undefined)), 'RATE_LIMIT')
+  assert.equal(classify(observedMessage('anthropic', 500, undefined)), 'SERVER')
+  // A status no rule names falls to the catch-all, which the first recognition
+  // already carries.
+  assert.equal(classify(observedMessage('anthropic', 404, undefined)), 'PI_AI_ERROR')
+})
+
+test('the #9352 fixture is the installed stack’s output, and the classifier’s verdict', async () => {
+  const classify = await installedClassifier()
+  const [failure] = REPORTED_STATUS_ONLY_TURN.map((chunk) => chunk.reason?.failure).filter(Boolean)
+  assert.equal(failure.message, observedMessage('anthropic', 400, undefined), 'the fixture must be what the installed clients write')
+  assert.equal(failure.code, classify(failure.message), 'the fixture must carry the code the installed classifier gives it')
+})
+
+test('the shipped status-only defaults are the ones the second report asks for', () => {
+  const resolved = resolveConfig()
+  assert.deepEqual([...resolved.statusOnlyCodes], ['INVALID_REQUEST'])
+  for (const [index, pattern] of resolved.statusOnlyMessages.entries()) {
+    assert.equal(String(pattern), String(new RegExp(DEFAULT_STATUS_ONLY_MESSAGES[index])), 'the compiled defaults must be the shipped ones')
+  }
+})
+
+test('the README documents both recognitions and both gates', () => {
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
+  for (const token of ['#8321', '#9352', 'statusOnlyCodes', 'statusOnlyMessages', 'PI_AI_ERROR', 'INVALID_REQUEST']) {
+    assert.ok(readme.includes(token), `the README must document ${token}`)
+  }
 })
