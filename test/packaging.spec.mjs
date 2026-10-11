@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import semver from 'semver'
 
-import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, DEFAULT_TRANSIENT_MESSAGES, DEFAULT_TRANSIENT_TARGET_CODE, DEFAULT_VETO_MESSAGES, resolveConfig } from '../lib/index.js'
+import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, DEFAULT_TRANSIENT_MESSAGES, DEFAULT_TRANSIENT_TARGET_CODE, DEFAULT_UNPARSEABLE_CALL_CODES, DEFAULT_VETO_MESSAGES, resolveConfig } from '../lib/index.js'
 import { REPORTED_STATUS_ONLY_TURN, REPORTED_TRANSIENT_TURN, clientSentence, observedMessage } from './harness.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -217,6 +217,13 @@ test('the shipped defaults are the ones the report asks for', () => {
   assert.ok(resolved.statusOnlyCodes.includes('INVALID_REQUEST'), 'a bare 400 status line is the code the second report is about')
   assert.ok(!resolved.codes.includes(resolved.targetCode), 'the target code is never a source code')
   assert.ok(!resolved.statusOnlyCodes.includes(resolved.targetCode), 'the target code is never a gated source code either')
+  // The fourth recognition's default is the code the installed adapter refuses
+  // malformed Tool arguments with — asserted here, and *read* from the adapter's
+  // own bundle by `test/deepseek-malformed.spec.mjs`, which drives the real
+  // adapter and checks the code it throws (#9402).
+  assert.deepEqual([...resolved.unparseableCallCodes], [...DEFAULT_UNPARSEABLE_CALL_CODES])
+  assert.deepEqual([...resolved.unparseableCallCodes], ['MALFORMED_RESPONSE'])
+  assert.ok(!resolved.unparseableCallCodes.includes(resolved.targetCode), 'the fourth recognition widens towards the target code, never from it')
 })
 
 /* ------------------------------------------------------------------ *
@@ -324,11 +331,12 @@ test('the shipped status-only defaults are the ones the second report asks for',
 test('the README documents every recognition and every gate', () => {
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
   for (const token of [
-    '#8321', '#9352', '#9397',
+    '#8321', '#9352', '#9397', '#9402',
     'statusOnlyCodes', 'statusOnlyMessages',
     'transientCodes', 'transientMessages', 'transientTargetCode',
+    'unparseableCallCodes',
     'vetoMessages',
-    'PI_AI_ERROR', 'INVALID_REQUEST', 'SERVER',
+    'PI_AI_ERROR', 'INVALID_REQUEST', 'SERVER', 'MALFORMED_RESPONSE',
   ]) {
     assert.ok(readme.includes(token), `the README must document ${token}`)
   }

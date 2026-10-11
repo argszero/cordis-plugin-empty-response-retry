@@ -158,6 +158,67 @@
  * as a token. The third recognition restores that classification; it does not
  * invent a stricter one.
  *
+ * ## The fourth report (discussion #9402), and what "malformed" is about
+ *
+ * A `dsh-llm-deepseek` route ended a turn with
+ *
+ * ```
+ * attempt t3s2 → error: MALFORMED_RESPONSE DeepSeek Messages stream: tool input is invalid JSON
+ * ```
+ *
+ * — an intermittently corrupt Tool call: the model streamed `{"path":` and stopped.
+ *
+ * The throw site is `translate.ts`'s `message_stop` branch, and the ordering there
+ * is the whole story:
+ *
+ * ```ts
+ * if (reason.kind !== 'max-tokens') {
+ *   for (const { content } of blocks.values()) {
+ *     if (content.type !== 'tool-call') continue
+ *     let parsed: unknown
+ *     try { parsed = JSON.parse(content.arguments) } catch (_invalidProviderToolJson) { return malformed('tool input is invalid JSON') }
+ *     object(parsed)
+ *   }
+ * }
+ * ```
+ *
+ * The Tool call's `block-end` chunk was yielded when `content_block_stop` arrived
+ * — *before* this parse. So this is not a truncated response (that is the
+ * `max-tokens` branch, deliberately skipped here and pruned by the shared
+ * assembler): it is a complete response whose Tool arguments the adapter refuses
+ * to read. `object()` widens the refusal beyond invalid JSON to any parse result
+ * that is not a plain record, so `null`, a bare string and a number land here too.
+ *
+ * `MALFORMED_RESPONSE` is in no retry table either (`packages/llm/llm/src/retry-policy.ts`),
+ * so the step is not repeated and the turn ends — and the reporter's own framing is
+ * right: the code names the *serialization*, not the request. The request may be
+ * perfectly replayable.
+ *
+ * **The fourth recognition is not a code list.** `MALFORMED_RESPONSE` has five
+ * producers in that adapter — the two in `sse.ts` for an undecodable envelope, the
+ * two in `translate.ts` for typed fields, and this one for Tool arguments — and
+ * four of them have nothing to do with a Tool call. Retrying those would be *safe*
+ * (a failed attempt commits nothing durable; see below), but a widening keyed on
+ * the code alone would be claiming a shape it never saw, and this plugin does not
+ * write claims it cannot check. The shape is the evidence, and it is fully visible
+ * at the `llm/stream` seam: the plugin sees the Tool call's `block-end` chunks
+ * *and* the terminal error finish the adapter's throw becomes
+ * (`LlmRuntime.adapterStream` normalizes it — the same terminal frame the other
+ * three recognitions read). So the fourth recognition is admitted when
+ * **the attempt's only output was Tool calls whose arguments the adapter could not
+ * read**: at least one Tool call was assembled, every one of them carried
+ * arguments `JSON.parse` + plain-record fails, and no text, reasoning or
+ * unknown-kind block arrived at all. Its claim is the first recognition's claim —
+ * *the attempt produced nothing durable* — reached through a different refusal, so
+ * it writes `EMPTY_RESPONSE` too.
+ *
+ * `arguments` is judged from the `block-end` chunk, and that string is **the same
+ * value the adapter parses at `message_stop`** (`if (block.json.length > 0)
+ * block.content.arguments = block.json` — the last thing done to the block). One
+ * block the attempt never closed, or a `max-tokens` finish, changes nothing here:
+ * the arm's code is `MALFORMED_RESPONSE`, which that adapter can only reach by
+ * throwing, and a throw means `message_stop` was entered with every block closed.
+ *
  * ## What this plugin does
  *
  * It wraps the public `llm/stream` waterfall — the one seam that sees an attempt
@@ -169,8 +230,8 @@
  * touched: the provider's message, status and `providerRetryAfterMs` are carried
  * through, so the session log still shows what the provider said.
  *
- * "Could not attribute" has three shapes, and they are one principle — *a code
- * chosen without a provider-authored diagnosis*:
+ * "Could not attribute" has four shapes, and they are one principle — *a code
+ * chosen without a provider-authored diagnosis of the request*:
  *
  * 1. `PI_AI_ERROR`, the adapter's catch-all: no rule matched the provider's text
  *    at all. This is `codes` (report #8321).
@@ -185,12 +246,20 @@
  *    — the code the chain would have written had the wording carried the number
  *    it dropped. It is the one shape that does not require an empty attempt, for
  *    the reason given above: it names the route, not the output.
+ * 4. `MALFORMED_RESPONSE`, but only when the attempt's entire output was Tool
+ *    calls the adapter could not read (report #9402). This is
+ *    `unparseableCallCodes`, and it is the one recognition whose gate is a
+ *    *shape* rather than a wording — the code has four other producers in the
+ *    same adapter that this plugin declines, because it cannot see their cause.
+ *    It writes `EMPTY_RESPONSE`, the same claim as 1 and 2.
  *
  * This is the structural fix the reporters preferred over adding one more regex
- * to a chain with a six-report history (#4361, #6595, #7691, #8321, #9352,
- * #9397) — every one of which enumerated a new wording. It is also strictly
- * *narrower* than the `retryableCodes: [..., PI_AI_ERROR]` workaround in the first
- * report, which widens every catch-all failure on a route; see the next section.
+ * to a chain that has answered every report that way (#4361, #6595, #7691, #8321,
+ * #9352, #9397, #9402). It is also strictly *narrower* than the
+ * `retryableCodes: [..., PI_AI_ERROR]` workaround in the first report, or the
+ * `retryableCodes: [..., MALFORMED_RESPONSE]` route setting in the fourth, which
+ * widen every catch-all (resp. every malformed) failure on a route; see the next
+ * section.
  *
  * **What it cannot do, and does not pretend to.** The report also asks for the
  * HTTP status, headers and a body snippet to be persisted, and for a cheap
@@ -237,17 +306,28 @@
  *   what a transcript reader sees — and therefore treats Tool calls as protocol
  *   rather than content (`packages/llm/llm/src/assistant-stream.ts:260-279`). A
  *   tool call is durable, so a durability test must not ignore it. This refusal
- *   is the `EMPTY_RESPONSE` claim being checked, so it applies to the two
+ *   is the `EMPTY_RESPONSE` claim being checked, so it applies to the three
  *   recognitions that make that claim and not to the transient one.
+ * - **A Tool call is durable only if its arguments are readable.** The fourth
+ *   recognition asks the same question — did anything durable happen — but a
+ *   `block-start`/`block-end` pair for an unreadable Tool call is not an answer
+ *   to it: the adapter refuses that call, so nothing it streamed was ever usable.
+ *   So the fourth arm reads the assembled block instead of the chunk: at least
+ *   one Tool call, every one unreadable, and no text, reasoning or unknown-kind
+ *   block. Any of those missing declines, which is the direction that leaves
+ *   today's behaviour alone.
  * - **The finish is not an error**, or is already the code it would be rewritten
  *   to, or is `aborted` (a caller cancellation is not a provider failure).
- * - **The code is not in `codes`, `statusOnlyCodes` or `transientCodes`.** A
+ * - **The code is not in `codes`, `statusOnlyCodes`, `transientCodes` or
+ *   `unparseableCallCodes`.** A
  *   failure the adapter named from something the provider actually said — `AUTH`,
  *   `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`, `RATE_LIMIT` — is
  *   somebody else's to recover from, and is left alone. `INVALID_REQUEST` is the
  *   one named code this plugin will touch, and only in its status-only form: a
  *   message carrying anything else, even two words, is a diagnosis and is
- *   declined.
+ *   declined. `MALFORMED_RESPONSE` is the other, and only in the shape above: four
+ *   of its five producers in that adapter are envelope corruptions this plugin
+ *   declines.
  * - **The message names a subscription limit.** `vetoMessages` is pi-ai's own
  *   non-retryable table (`GoUsageLimitError`, `insufficient_quota`, `out of
  *   budget`, `billing`, …), and it
@@ -265,8 +345,11 @@
  *   behaviour exactly as it is.
  *
  * The guard is streaming-preserving: every chunk is yielded the moment it
- * arrives, at most the last one is rewritten, and the only state it keeps is one
- * boolean. It never buffers, never reorders, and never delays a chunk.
+ * arrives, at most the last one is rewritten, and the state it keeps is one
+ * boolean plus three counters' worth of evidence a Tool call block's `block-end`
+ * leaves behind. It never buffers, never reorders, and never delays a chunk: the
+ * Tool call's arguments are read from the assembled block the adapter already
+ * emitted, not assembled here.
  *
  * @module @argszero/cordis-plugin-empty-response-retry
  */
@@ -417,6 +500,26 @@ export const DEFAULT_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([
 export const DEFAULT_TRANSIENT_TARGET_CODE = 'SERVER'
 
 /**
+ * Default codes admitted by the fourth recognition: the adapter's malformed-stream
+ * code, and only in the one shape that is about a Tool call.
+ *
+ * `MALFORMED_RESPONSE` is what `dsh-llm-deepseek` reports for five different
+ * corruptions — an undecodable SSE envelope (twice in `sse.ts`), a typed field
+ * that is not what the wire promised, and Tool arguments that are not a readable
+ * JSON record (`translate.ts`). Only the last is this recognition's subject, and
+ * the code cannot tell them apart, which is exactly why the shape below is the
+ * gate and this list is not.
+ *
+ * The other four are left alone deliberately. A widening keyed on the code alone —
+ * `retryableCodes: [..., MALFORMED_RESPONSE]` on the route, the workaround the
+ * fourth report also mentions — would repeat all of them, and while that happens
+ * to be safe, it is also a claim about a failure whose cause this plugin never
+ * saw, and it takes the route's whole budget for envelope corruptions an operator
+ * may want counted rather than retried.
+ */
+export const DEFAULT_UNPARSEABLE_CALL_CODES: readonly string[] = Object.freeze(['MALFORMED_RESPONSE'])
+
+/**
  * Default refusal, taken from pi-ai's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
  *
  * Quoted verbatim from the installed table, like the transient list above, and
@@ -512,6 +615,15 @@ export interface Config {
    */
   transientTargetCode?: string
   /**
+   * Failure codes widened only when the attempt's entire output was Tool calls
+   * whose arguments the adapter could not read — at least one such call, no
+   * readable call, and no text, reasoning or unknown-kind block. Defaults to
+   * `['MALFORMED_RESPONSE']`, the code `dsh-llm-deepseek` reports for a corrupt
+   * Tool call — and for four envelope-level corruptions this recognition does not
+   * match, which is the point of the gate being a shape.
+   */
+  unparseableCallCodes?: string[]
+  /**
    * Regular-expression sources; a failure whose message matches any of them is
    * declined, whatever its code and whichever recognition would have admitted
    * it. Defaults to pi-ai's own non-retryable limit table — see
@@ -540,6 +652,7 @@ export interface ResolvedConfig {
   readonly transientCodes: readonly string[]
   readonly transientMessages: readonly RegExp[]
   readonly transientTargetCode: string
+  readonly unparseableCallCodes: readonly string[]
   readonly vetoMessages: readonly RegExp[]
   readonly exceptMessages: readonly RegExp[]
   readonly targetCode: string
@@ -553,6 +666,8 @@ export type WidenBasis =
   | 'status-only'
   /** `transientCodes`: the wording is one pi-ai's own retry table admits. */
   | 'transient'
+  /** `unparseableCallCodes`: the attempt's only output was unreadable Tool calls. */
+  | 'unparseable-call'
 
 /** One recognition, as it is logged. */
 export interface WidenEvidence {
@@ -638,6 +753,7 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   const codes = stringList('codes', config.codes, DEFAULT_CODES)
   const statusOnlyCodes = stringList('statusOnlyCodes', config.statusOnlyCodes, DEFAULT_STATUS_ONLY_CODES)
   const transientCodes = stringList('transientCodes', config.transientCodes, DEFAULT_TRANSIENT_CODES)
+  const unparseableCallCodes = stringList('unparseableCallCodes', config.unparseableCallCodes, DEFAULT_UNPARSEABLE_CALL_CODES)
   const targetCode = codeName('targetCode', config.targetCode, DEFAULT_TARGET_CODE)
   const transientTargetCode = codeName('transientTargetCode', config.transientTargetCode, DEFAULT_TRANSIENT_TARGET_CODE)
   return Object.freeze({
@@ -645,6 +761,7 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     codes,
     statusOnlyCodes,
     transientCodes,
+    unparseableCallCodes,
     targetCode,
     transientTargetCode,
     statusOnlyMessages: patternList('statusOnlyMessages', config.statusOnlyMessages, DEFAULT_STATUS_ONLY_MESSAGES),
@@ -684,9 +801,113 @@ export function chunkCarriesContent(chunk: StreamChunk): boolean {
 }
 
 /**
+ * Whether one Tool call's streamed arguments are what the adapter demands of them.
+ *
+ * The predicate is the adapter's own, quoted from `translate.ts`'s `message_stop`
+ * branch: `JSON.parse`, then a plain record. The second half is not decoration —
+ * `object()` rejects `null`, an array, a string and a number, so `"README.md"` or
+ * `123` is as unreadable to the adapter as `{"path":` is, and a plugin that only
+ * caught the `catch` would decline four of the five shapes the adapter refuses.
+ *
+ * The string tested is the one from the Tool call's `block-end` chunk. In
+ * `dsh-llm-deepseek` that is byte-for-byte the value the adapter parses
+ * (`if (block.json.length > 0) block.content.arguments = block.json`, the last
+ * write to the block before it is yielded), so the two tests cannot disagree.
+ * @param argumentsJson - a Tool call block's raw `arguments`, as the adapter emitted it.
+ * @returns whether the adapter would accept those arguments.
+ */
+export function toolArgumentsReadable(argumentsJson: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(argumentsJson)
+  } catch (_unreadableToolArguments) {
+    return false
+  }
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+}
+
+/**
+ * What one attempt has produced so far, folded from the chunks before its finish.
+ *
+ * Four facts, because the four recognitions ask three different questions of an
+ * attempt: whether *anything* durable happened (`content`, the `EMPTY_RESPONSE`
+ * claim), whether the only thing that happened was Tool calls nobody can read
+ * (`calls` + `callsUnreadable` + `readable`), and nothing at all for the transient
+ * one.
+ */
+export interface AttemptOutput {
+  /** A content-bearing chunk arrived at all — {@link chunkCarriesContent}. */
+  readonly content: boolean
+  /** Tool-call blocks the attempt assembled. */
+  readonly calls: number
+  /** Every Tool call assembled so far carried arguments the adapter cannot read. */
+  readonly callsUnreadable: boolean
+  /** Text, reasoning, or a block kind this plugin does not know arrived. */
+  readonly readable: boolean
+}
+
+/** The evidence of an attempt that has produced nothing yet. */
+export const NO_OUTPUT: AttemptOutput = Object.freeze({
+  content: false,
+  calls: 0,
+  callsUnreadable: true,
+  readable: false,
+})
+
+/**
+ * Fold one chunk into an attempt's evidence.
+ *
+ * A Tool call is judged at its `block-end`, which the adapter assembles; its
+ * deltas are fragments of a string that only means something once complete, so
+ * they add nothing here (and add nothing durable either — see the module
+ * docstring on what a retry could duplicate).
+ * @param output - the evidence so far.
+ * @param chunk - the next chunk of the attempt.
+ * @returns the evidence including this chunk.
+ */
+export function recordAttemptOutput(output: AttemptOutput, chunk: StreamChunk): AttemptOutput {
+  if (chunk.type === 'tool-call-delta') return output
+  if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') {
+    return {
+      ...output,
+      content: true,
+      calls: output.calls + 1,
+      callsUnreadable: output.callsUnreadable && !toolArgumentsReadable(chunk.block.arguments),
+    }
+  }
+  if (!chunkCarriesContent(chunk)) return output
+  // A Tool call's own block-start is content (`chunkCarriesContent` says so) but
+  // is not `readable`: that flag is the narrower claim the fourth recognition
+  // uses, and it means text, reasoning, or a kind this plugin does not know.
+  const toolCall = chunk.type === 'block-start' && chunk.blockType === 'tool-call'
+  return { ...output, content: true, readable: output.readable || !toolCall }
+}
+
+/**
+ * Whether an attempt's entire output was Tool calls the adapter could not read.
+ *
+ * The fourth recognition's shape, and the whole of what makes it narrower than a
+ * code list. At least one Tool call has to exist: every producer of
+ * `MALFORMED_RESPONSE` that never assembled one — an undecodable SSE envelope, a
+ * duplicate `message_start`, a delta without an open block, a typed field of the
+ * wrong type — is declined here, because the plugin cannot see what those were
+ * and will not report a shape it did not observe. "Every one of them unreadable"
+ * is the vacuous half of the same statement; one readable call means the adapter
+ * refused this attempt for a reason that is about that call rather than about the
+ * attempt, and the honest reading of that is the adapter's code, unchanged. And
+ * `readable` is the `EMPTY_RESPONSE` claim again: text or reasoning that arrived
+ * is content, whatever the Tool call did.
+ * @param output - one attempt's folded evidence.
+ * @returns whether the attempt is the fourth recognition's shape.
+ */
+export function onlyUnreadableCalls(output: AttemptOutput): boolean {
+  return output.calls > 0 && output.callsUnreadable && !output.readable
+}
+
+/**
  * Decide why one failure's code is admitted, or that it is not.
  *
- * The three recognitions this plugin has, in the order they are checked:
+ * The four recognitions this plugin has, in the order they are checked:
  *
  * - `transientCodes` (default the catch-all) **first**, when the message is a
  *   wording pi-ai's own retry table carries: the most specific thing that can be
@@ -695,18 +916,27 @@ export function chunkCarriesContent(chunk: StreamChunk): boolean {
  *   *is* attributed, and the catch-all's code would be the wrong name for it.
  * - `codes` (default the catch-all) next, unconditionally: the adapter could not
  *   name the failure, so its code carries no diagnosis to contradict.
+ * - `unparseableCallCodes` (default `MALFORMED_RESPONSE`) next: a code the adapter
+ *   *did* choose, but for a refusal about serialization rather than about the
+ *   request. It carries the strongest gate of the four — the attempt's whole
+ *   output has to be unreadable Tool calls — and that gate lives in
+ *   {@link classifyEmptyAttempt}, because it is a fact about the attempt rather
+ *   than about the failure. Admission here means only that the code is one this
+ *   recognition may consider.
  * - `statusOnlyCodes` (default `INVALID_REQUEST`) last, and only when the
  *   message is nothing but the HTTP status the *client* wrote. The code is a
  *   name for the client's inability to read the response, not for anything the
  *   provider said, so the failure is as unattributed as the catch-all is.
  *
- * The veto precedes all three. pi-ai declines a subscription or billing limit
+ * The veto precedes all four. pi-ai declines a subscription or billing limit
  * before it consults its retryable table, and a limit that resets in hours is
  * not the safe repeat retry policy is for — so a wording that names one is
  * refused here too, however it got its code.
  *
  * A code in more than one list is admitted by whichever recognition comes first;
- * the ordering above is the whole of the precedence rule.
+ * the ordering above is the whole of the precedence rule. A code in `codes` *and*
+ * in `unparseableCallCodes` is therefore widened unconditionally, as `codes`
+ * describes, and needs no shape — an operator who wants that has said so.
  * @param failure - the failure the adapter produced.
  * @param config - the resolved config.
  * @returns which recognition admitted it, or `null` to leave the finish alone.
@@ -716,6 +946,7 @@ export function widenBasis(failure: LlmFailure, config: ResolvedConfig): WidenBa
   if (config.transientCodes.includes(failure.code)
     && config.transientMessages.some((pattern) => pattern.test(failure.message))) return 'transient'
   if (config.codes.includes(failure.code)) return 'catch-all'
+  if (config.unparseableCallCodes.includes(failure.code)) return 'unparseable-call'
   if (!config.statusOnlyCodes.includes(failure.code)) return null
   return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? 'status-only' : null
 }
@@ -723,8 +954,11 @@ export function widenBasis(failure: LlmFailure, config: ResolvedConfig): WidenBa
 /**
  * The code one recognition writes.
  *
- * The transient recognition names the route (`SERVER`), the other two name the
- * attempt's output (`EMPTY_RESPONSE`), so they do not share a target.
+ * The transient recognition names the route (`SERVER`); the other three name the
+ * attempt's output (`EMPTY_RESPONSE`), so they do not share a target. The fourth
+ * is one of the three: an attempt whose only output the adapter refused is an
+ * attempt that produced nothing durable, which is the claim `EMPTY_RESPONSE`
+ * makes — and the reason it is not a fourth knob of its own.
  * @param basis - the recognition that admitted the failure.
  * @param config - the resolved config.
  * @returns the code the finish is rewritten to.
@@ -738,8 +972,8 @@ export function targetCodeFor(basis: WidenBasis, config: ResolvedConfig): string
  * under a code the retry policy admits.
  *
  * The refusals are ordered deliberately. What a failure *is* comes before what
- * the attempt produced, because the first two recognitions rewrite the code to
- * `EMPTY_RESPONSE` — a claim that the attempt produced nothing durable — so for
+ * the attempt produced, because three of the four recognitions rewrite the code
+ * to `EMPTY_RESPONSE` — a claim that the attempt produced nothing durable — so for
  * them that claim is a precondition. The transient recognition makes no such
  * claim (it writes a code about the route), and the harness's own executor
  * agrees: `dsh-llm-retry` gates on `policy.retryableCodes.includes(failure.code)`
@@ -747,22 +981,31 @@ export function targetCodeFor(basis: WidenBasis, config: ResolvedConfig): string
  * whether or not a token arrived first. Requiring an empty attempt here would
  * make this plugin stricter than the policy it feeds, for a failure it can
  * actually name.
+ *
+ * The fourth recognition checks the same claim through a narrower reading of the
+ * evidence, because the broad reading asks the wrong question for it: a Tool call
+ * the adapter refused contributes `block-start` and `block-end` chunks, so
+ * `output.content` is true of exactly the attempt this recognition exists to
+ * catch. {@link onlyUnreadableCalls} asks what those blocks *were* instead of
+ * whether any arrived.
  * @param reason - the finish reason the adapter produced.
- * @param producedContent - whether the attempt emitted any content-bearing chunk.
+ * @param output - everything the attempt emitted before this finish.
  * @param config - the resolved config.
  * @returns the failure to write in place of the adapter's, or `null` to leave
  *   the finish exactly as it is.
  */
 export function classifyEmptyAttempt(
   reason: FinishReason,
-  producedContent: boolean,
+  output: AttemptOutput,
   config: ResolvedConfig,
 ): LlmFailure | null {
   if (reason.kind !== 'error') return null
   const failure = reason.failure
   const basis = widenBasis(failure, config)
   if (basis === null) return null
-  if (producedContent && basis !== 'transient') return null
+  if (basis === 'unparseable-call') {
+    if (!onlyUnreadableCalls(output)) return null
+  } else if (basis !== 'transient' && output.content) return null
   const targetCode = targetCodeFor(basis, config)
   if (failure.code === targetCode) return null
   if (config.exceptMessages.some((pattern) => pattern.test(failure.message))) return null
@@ -788,20 +1031,22 @@ export function rewriteFinish(
 
 /**
  * The guard: forward every chunk the moment it arrives, and widen a terminal
- * frame that is an empty attempt the adapter could not name.
+ * frame whose failure the adapter could not attribute to anything the provider
+ * said.
  *
  * **Streaming-preserving by construction.** The verdict needs only the terminal
- * chunk and one boolean accumulated from the chunks before it, so nothing is
- * buffered: every chunk is yielded as it arrives and at most the last one is
- * rewritten.
+ * chunk and the evidence the chunks before it left behind — folded by
+ * {@link recordAttemptOutput}, which reads a Tool call's arguments from the
+ * `block-end` the adapter already assembled — so nothing is buffered: every chunk
+ * is yielded as it arrives and at most the last one is rewritten.
  * @param source - the upstream chunk stream, i.e. `next()`.
  * @param config - the resolved config.
  * @param route - the provider/model the request went to, for the log line.
  * @param onWiden - called once per recognized finish, including in `warn` mode.
  *   Kept as a parameter so the generator stays pure and log-free for tests; the
  *   plugin passes a `ctx.logger.warn` delegate.
- * @returns the stream, with an unclassifiable empty attempt reported as
- *   `EMPTY_RESPONSE`.
+ * @returns the stream, with an attempt the adapter could not attribute reported
+ *   as the code the retry policy admits.
  */
 export async function* guardEmptyResponseStream(
   source: AsyncIterable<StreamChunk>,
@@ -814,7 +1059,7 @@ export async function* guardEmptyResponseStream(
     return
   }
 
-  let producedContent = false
+  let output: AttemptOutput = NO_OUTPUT
 
   for await (const chunk of source) {
     if (chunk.type === 'finish' && chunk.reason.kind === 'error') {
@@ -822,7 +1067,7 @@ export async function* guardEmptyResponseStream(
       const basis = widenBasis(failure, config)
       // `classifyEmptyAttempt` reaches the same verdict through the same helper,
       // so asking again for the log line cannot disagree with the decision.
-      const widened = basis === null ? null : classifyEmptyAttempt(chunk.reason, producedContent, config)
+      const widened = basis === null ? null : classifyEmptyAttempt(chunk.reason, output, config)
       if (widened !== null && basis !== null) {
         onWiden?.({
           code: failure.code,
@@ -841,7 +1086,7 @@ export async function* guardEmptyResponseStream(
       yield chunk
       continue
     }
-    if (!producedContent && chunkCarriesContent(chunk)) producedContent = true
+    output = recordAttemptOutput(output, chunk)
     yield chunk
   }
 }
@@ -866,7 +1111,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       { provider: options.provider, model: options.model },
       (evidence) => {
         ctx.logger.warn(
-          'empty-response-retry: %s/%s failed as %s ("%s") — %s; %s (discussions #8321, #9352, #9397)',
+          'empty-response-retry: %s/%s failed as %s ("%s") — %s; %s (discussions #8321, #9352, #9397, #9402)',
           evidence.provider,
           evidence.model,
           evidence.code,
@@ -875,7 +1120,9 @@ export function apply(ctx: Context, config: Config = {}): void {
             ? 'the adapter named no cause, and the attempt produced nothing'
             : evidence.basis === 'status-only'
               ? 'named from the HTTP status line alone, with no provider body to read'
-              : 'a wording pi-ai itself retries, which the adapter\'s rule chain cannot place',
+              : evidence.basis === 'unparseable-call'
+                ? 'the adapter read no cause either, only Tool calls whose arguments it refused to parse'
+                : 'a wording pi-ai itself retries, which the adapter\'s rule chain cannot place',
           evidence.verdict === 'error'
             ? `reported as ${evidence.targetCode} so the retry policy can repeat the attempt`
             : 'left unchanged (warn mode)',

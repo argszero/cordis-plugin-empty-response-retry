@@ -46,10 +46,17 @@ const COPIED = ['src', 'test', 'tsconfig.json', 'README.md', 'LICENSE', 'cordis.
  */
 const HARNESS = [
   '@deepseek-ai/dsh-llm',
+  '@deepseek-ai/dsh-llm-deepseek',
   '@deepseek-ai/dsh-llm-pi-ai',
   '@deepseek-ai/dsh-llm-retry',
   '@deepseek-ai/dsh-session',
   '@deepseek-ai/dsh-session-projection',
+  // The session stack peers on these three, and npm's strict peer resolution
+  // refuses the tree without them named explicitly — so leaving them at the
+  // manifest's pin would probe a mixed tree and report it as one line.
+  '@deepseek-ai/dsh-anonymous-user-id',
+  '@deepseek-ai/dsh-atomic-write',
+  '@deepseek-ai/dsh-home-paths',
 ]
 
 /**

@@ -27,7 +27,7 @@ import SessionProjection from '@deepseek-ai/dsh-session-projection'
 import * as LlmRetry from '@deepseek-ai/dsh-llm-retry'
 
 import * as plugin from '../lib/index.js'
-import { REPORTED_EMPTY_TURN, REPORTED_STATUS_ONLY_TURN, ROUTE, ScriptedAdapter, drain, observedMessage, streamOnce } from './harness.mjs'
+import { MALFORMED_TOOL_TURN, PARSEABLE_TOOL_TURN, REPORTED_EMPTY_TURN, REPORTED_STATUS_ONLY_TURN, ROUTE, ScriptedAdapter, drain, observedMessage, streamOnce } from './harness.mjs'
 
 /**
  * The shipped defaults, with the wait shortened.
@@ -176,4 +176,44 @@ test('an always-mode provider policy accepts the widened failure too', async () 
   const failure = await failureOf(ctx)
   const always = resolveRetryPolicy({ mode: 'always', backoff: { initialDelayMs: 1, maxDelayMs: 1, jitterRatio: 0 } }, 'test')
   assert.deepEqual(await dispatch(ctx, { session, failure, policy: always }), { kind: 'retry' })
+})
+
+/* ------------------------------------------------------------------ *
+ * the fourth report (#9402) through the same real executor
+ * ------------------------------------------------------------------ */
+
+test('the reported malformed Tool call is retried by the real executor, and written down', async () => {
+  const { ctx, session } = await recoveryWorld(true, MALFORMED_TOOL_TURN)
+  const failure = await failureOf(ctx)
+  // The adapter's own sentence survives the rewrite, which is the only thing it
+  // said about the attempt — and the raw arguments it refused are durable in the
+  // recorded attempt, so the retry loses nothing (#9402, ask 3).
+  assert.equal(failure.code, EMPTY_RESPONSE_CODE)
+  assert.equal(failure.message, 'DeepSeek Messages stream: tool input is invalid JSON')
+
+  assert.deepEqual(await dispatch(ctx, { session, failure }), { kind: 'retry' })
+  assert.deepEqual(eventTypes(session), ['llm/retry', 'llm/retry-started'])
+  assert.equal(session.snapshotEvents()[0].data.failure.code, EMPTY_RESPONSE_CODE)
+})
+
+test('control: unmounted, the #9402 turn ends the step — nobody retries MALFORMED_RESPONSE', async () => {
+  const { ctx, session } = await recoveryWorld(false, MALFORMED_TOOL_TURN)
+  const failure = await failureOf(ctx)
+  assert.equal(failure.code, 'MALFORMED_RESPONSE')
+
+  assert.equal(await dispatch(ctx, { session, failure }), undefined)
+  assert.deepEqual(eventTypes(session), [])
+})
+
+test('control: the same failure beside a readable Tool call is not retried either', async () => {
+  // The fourth recognition is a claim about the attempt's *shape*, not about its
+  // code: the adapter refuses a turn that assembled one readable call and one
+  // corrupt one exactly as it refuses a turn whose only call is corrupt, and the
+  // plugin must read that difference instead of the code.
+  const { ctx, session } = await recoveryWorld(true, PARSEABLE_TOOL_TURN)
+  const failure = await failureOf(ctx)
+  assert.equal(failure.code, 'MALFORMED_RESPONSE')
+
+  assert.equal(await dispatch(ctx, { session, failure }), undefined)
+  assert.deepEqual(eventTypes(session), [])
 })

@@ -18,19 +18,26 @@ import {
   DEFAULT_TRANSIENT_CODES,
   DEFAULT_TRANSIENT_MESSAGES,
   DEFAULT_TRANSIENT_TARGET_CODE,
+  DEFAULT_UNPARSEABLE_CALL_CODES,
   DEFAULT_VETO_MESSAGES,
+  NO_OUTPUT,
   apply as applyPlugin,
   chunkCarriesContent,
   classifyEmptyAttempt,
   guardEmptyResponseStream,
   inject,
   name,
+  onlyUnreadableCalls,
+  recordAttemptOutput,
   resolveConfig,
   targetCodeFor,
+  toolArgumentsReadable,
   widenBasis,
 } from '../lib/index.js'
 import {
   DEFERRED_TURN,
+  MALFORMED_TOOL_TURN,
+  PARSEABLE_TOOL_TURN,
   PENDING_TURN,
   REPORTED_EMPTY_TURN,
   REPORTED_STATUS_ONLY_TURN,
@@ -39,11 +46,23 @@ import {
   drain,
   finishOf,
   observedMessage,
+  outputOf,
   streamOnce,
   world,
 } from './harness.mjs'
 
 const REASON = (code, message) => ({ kind: 'error', failure: { code, message } })
+
+/**
+ * Attempt evidence, as it reads at the finish.
+ *
+ * `classifyEmptyAttempt` takes the whole record rather than the old boolean,
+ * because the fourth recognition cannot be answered by one boolean: a Tool call
+ * sets the broad content flag and is still not durable. These two shorthands are
+ * the two states the first three recognitions distinguish, spelled out.
+ */
+const NOTHING_PRODUCED = NO_OUTPUT
+const CONTENT_PRODUCED = { content: true, calls: 0, callsUnreadable: true, readable: true }
 
 /* ------------------------------------------------------------------ *
  * the reported turn
@@ -76,7 +95,7 @@ test('the rewrite is announced on the host, naming the report', async () => {
   const [entry] = logged
   assert.equal(entry.type, 'warn')
   // The exporter hands over the printf template and its arguments separately.
-  assert.match(String(entry.args[0]), /^empty-response-retry: .*\(discussions #8321, #9352, #9397\)$/)
+  assert.match(String(entry.args[0]), /^empty-response-retry: .*\(discussions #8321, #9352, #9397, #9402\)$/)
   assert.deepEqual(entry.args.slice(1), [
     'openrouter',
     'deepseek/deepseek-v4.1-flash',
@@ -530,6 +549,8 @@ test('resolveConfig fails loud on every field', () => {
   assert.throws(() => resolveConfig({ statusOnlyCodes: [] }), /`statusOnlyCodes` must be a non-empty array/)
   assert.throws(() => resolveConfig({ statusOnlyCodes: [''] }), /non-empty strings/)
   assert.throws(() => resolveConfig({ targetCode: '' }), /`targetCode` must be a non-empty string/)
+  assert.throws(() => resolveConfig({ unparseableCallCodes: [] }), /`unparseableCallCodes` must be a non-empty array/)
+  assert.throws(() => resolveConfig({ unparseableCallCodes: [''] }), /non-empty strings/)
   assert.throws(() => resolveConfig({ transientCodes: [] }), /`transientCodes` must be a non-empty array/)
   assert.throws(() => resolveConfig({ transientTargetCode: '' }), /`transientTargetCode` must be a non-empty string/)
   assert.throws(() => resolveConfig({ vetoMessages: [] }), /`vetoMessages` must be a non-empty array/)
@@ -543,6 +564,7 @@ test('resolveConfig fails loud on every field', () => {
   assert.deepEqual(resolved.codes, ['PI_AI_ERROR'])
   assert.deepEqual(resolved.statusOnlyCodes, ['INVALID_REQUEST'])
   assert.deepEqual(resolved.transientCodes, ['PI_AI_ERROR'])
+  assert.deepEqual(resolved.unparseableCallCodes, [...DEFAULT_UNPARSEABLE_CALL_CODES])
   assert.equal(resolved.targetCode, EMPTY_RESPONSE_CODE)
   assert.equal(resolved.transientTargetCode, DEFAULT_TRANSIENT_TARGET_CODE)
   assert.ok(resolved.exceptMessages[0].test('pi-ai stream error'))
@@ -597,39 +619,55 @@ test('chunkCarriesContent: bookkeeping no, token fragments yes, blocks and the u
 test('classifyEmptyAttempt: the whole predicate in one table', () => {
   const config = resolveConfig()
   assert.deepEqual(
-    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'Provider returned an empty response'), false, config),
+    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'Provider returned an empty response'), NOTHING_PRODUCED, config),
     { code: EMPTY_RESPONSE_CODE, message: 'Provider returned an empty response' },
   )
   assert.deepEqual(
-    classifyEmptyAttempt(REASON('INVALID_REQUEST', '400 status code (no body)'), false, config),
+    classifyEmptyAttempt(REASON('INVALID_REQUEST', '400 status code (no body)'), NOTHING_PRODUCED, config),
     { code: EMPTY_RESPONSE_CODE, message: '400 status code (no body)' },
   )
   assert.deepEqual(
-    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'exceeded request buffer limit while retrying upstream'), false, config),
+    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'exceeded request buffer limit while retrying upstream'), NOTHING_PRODUCED, config),
     { code: 'SERVER', message: 'exceeded request buffer limit while retrying upstream' },
   )
   // The transient recognition is the one that does not need an empty attempt.
   assert.deepEqual(
-    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'upstream overloaded'), true, config),
+    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'upstream overloaded'), CONTENT_PRODUCED, config),
     { code: 'SERVER', message: 'upstream overloaded' },
   )
+  // The fourth recognition is the fourth shape of the same claim, and the one the
+  // broad content flag cannot answer: a refused Tool call sets it.
+  const unreadable = outputOf(MALFORMED_TOOL_TURN)
+  assert.equal(unreadable.content, true, 'a Tool call is content under the broad test — that is why the fourth arm cannot use it')
+  assert.deepEqual(
+    classifyEmptyAttempt(REASON('MALFORMED_RESPONSE', MALFORMED_TOOL_TURN.at(-1).reason.failure.message), unreadable, config),
+    { code: EMPTY_RESPONSE_CODE, message: 'DeepSeek Messages stream: tool input is invalid JSON' },
+  )
   const no = [
-    [REASON('PI_AI_ERROR', 'Provider returned an empty response'), true],
-    [REASON('PI_AI_ERROR', 'pi-ai stream error'), false],
-    [REASON('PI_AI_ERROR', 'pi-ai stream for model "m" ended pending'), false],
-    [REASON('PI_AI_ERROR', 'billing'), false],
-    [REASON('PI_AI_ERROR', 'out of budget'), true],
-    [REASON('RATE_LIMIT', '429'), false],
-    [REASON(EMPTY_RESPONSE_CODE, 'already widened'), false],
-    [REASON('SERVER', 'upstream overloaded'), false],
-    [REASON('INVALID_REQUEST', '400 status code (no body)'), true],
-    [{ kind: 'stop' }, false],
-    [{ kind: 'max-tokens' }, false],
-    [{ kind: 'tool-calls' }, false],
-    [{ kind: 'aborted', failure: { code: 'ABORTED', message: 'x' } }, false],
+    [REASON('PI_AI_ERROR', 'Provider returned an empty response'), CONTENT_PRODUCED],
+    [REASON('PI_AI_ERROR', 'pi-ai stream error'), NOTHING_PRODUCED],
+    [REASON('PI_AI_ERROR', 'pi-ai stream for model "m" ended pending'), NOTHING_PRODUCED],
+    [REASON('PI_AI_ERROR', 'billing'), NOTHING_PRODUCED],
+    [REASON('PI_AI_ERROR', 'out of budget'), CONTENT_PRODUCED],
+    [REASON('RATE_LIMIT', '429'), NOTHING_PRODUCED],
+    [REASON(EMPTY_RESPONSE_CODE, 'already widened'), NOTHING_PRODUCED],
+    [REASON('SERVER', 'upstream overloaded'), NOTHING_PRODUCED],
+    [REASON('INVALID_REQUEST', '400 status code (no body)'), CONTENT_PRODUCED],
+    [{ kind: 'stop' }, NOTHING_PRODUCED],
+    [{ kind: 'max-tokens' }, NOTHING_PRODUCED],
+    [{ kind: 'tool-calls' }, NOTHING_PRODUCED],
+    [{ kind: 'aborted', failure: { code: 'ABORTED', message: 'x' } }, NOTHING_PRODUCED],
+    // The fourth arm, refused three ways: the code without the shape…
+    [REASON('MALFORMED_RESPONSE', 'DeepSeek Messages stream: unsupported stop reason "x"'), NOTHING_PRODUCED],
+    // …the shape with a readable call beside it…
+    [REASON('MALFORMED_RESPONSE', MALFORMED_TOOL_TURN.at(-1).reason.failure.message), outputOf(PARSEABLE_TOOL_TURN)],
+    // …the shape with text or reasoning beside the unreadable call…
+    [REASON('MALFORMED_RESPONSE', MALFORMED_TOOL_TURN.at(-1).reason.failure.message), { ...unreadable, readable: true }],
+    // …and the same code reaching this plugin on a code list of its own.
+    [REASON(EMPTY_RESPONSE_CODE, MALFORMED_TOOL_TURN.at(-1).reason.failure.message), unreadable],
   ]
-  for (const [reason, produced] of no) {
-    assert.equal(classifyEmptyAttempt(reason, produced, config), null, JSON.stringify(reason))
+  for (const [reason, output] of no) {
+    assert.equal(classifyEmptyAttempt(reason, output, config), null, JSON.stringify(reason))
   }
 })
 
@@ -681,6 +719,49 @@ test('widenBasis: which recognition admits a code, and what it refuses', () => {
   // …and the transient recognition is the first way when its wording matches.
   const transient = resolveConfig({ transientCodes: ['INVALID_REQUEST'] })
   assert.equal(widenBasis({ code: 'INVALID_REQUEST', message: 'upstream overloaded' }, transient), 'transient')
+})
+
+test('widenBasis: the fourth recognition is admitted on its code, and is behind the catch-all', () => {
+  const config = resolveConfig()
+  // The fourth recognition has no message test at all: the code is the adapter's
+  // own refusal to read the response, and the shape that qualifies it is a fact
+  // about the attempt — checked in `classifyEmptyAttempt`, not here.
+  assert.equal(widenBasis({ code: 'MALFORMED_RESPONSE', message: 'DeepSeek Messages stream: tool input is invalid JSON' }, config), 'unparseable-call')
+  assert.equal(widenBasis({ code: 'MALFORMED_RESPONSE', message: 'anything at all' }, config), 'unparseable-call')
+  // Every other shape of the same code is the adapter's to keep.
+  assert.equal(widenBasis({ code: 'EMPTY_RESPONSE', message: 'DeepSeek Messages stream: tool input is invalid JSON' }, config), null)
+  // The knob is real, and it replaces the shipped list rather than extending it.
+  const other = resolveConfig({ unparseableCallCodes: ['SOME_OTHER_CODE'] })
+  assert.equal(widenBasis({ code: 'SOME_OTHER_CODE', message: 'x' }, other), 'unparseable-call')
+  assert.equal(widenBasis({ code: 'MALFORMED_RESPONSE', message: 'x' }, other), null)
+  // An operator who also lists the code under `codes` gets that recognition, which
+  // promises admission on the code alone, and the shape gate is not applied.
+  const blunt = resolveConfig({ codes: ['MALFORMED_RESPONSE'] })
+  assert.equal(widenBasis({ code: 'MALFORMED_RESPONSE', message: 'x' }, blunt), 'catch-all')
+})
+
+test('toolArgumentsReadable: the adapter’s two demands, and the five shapes object() refuses', () => {
+  for (const readable of ['{}', '{"path":"README.md"}', '{"a":{"b":[1,2]}}']) {
+    assert.equal(toolArgumentsReadable(readable), true, readable)
+  }
+  // A record is the second demand: `object()` in the adapter's `replay.ts` rejects
+  // these as firmly as it rejects a syntax error, which is the half a bare
+  // `try { JSON.parse } catch` loses.
+  for (const unreadable of ['{"path":', '', '{"path": }', '[]', 'null', '123', '"README.md"', 'true']) {
+    assert.equal(toolArgumentsReadable(unreadable), false, unreadable)
+  }
+})
+
+test('onlyUnreadableCalls: a call has to exist, every one has to be unreadable, and nothing else may have arrived', () => {
+  const shape = (calls, callsUnreadable, readable) => onlyUnreadableCalls({ content: true, calls, callsUnreadable, readable })
+  assert.equal(shape(1, true, false), true)
+  assert.equal(shape(2, true, false), true)
+  // Each half declines on its own: no call assembled at all…
+  assert.equal(shape(0, true, false), false)
+  // …one call the adapter could read…
+  assert.equal(shape(1, false, false), false)
+  // …and text or reasoning beside them.
+  assert.equal(shape(1, true, true), false)
 })
 
 test('the shipped gate defaults are the shapes the installed clients write', () => {

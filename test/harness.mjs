@@ -169,6 +169,103 @@ export const DEFERRED_TURN = [
   },
 ]
 
+/**
+ * The route the fourth report ran: the official DeepSeek Messages adapter.
+ *
+ * Its `translate.ts` is the only adapter that validates Tool arguments at
+ * `message_stop`, which is what makes this failure reachable at all; the suite
+ * that uses this route (`test/deepseek-malformed.spec.mjs`) drives the installed
+ * adapter rather than a scripted stand-in.
+ */
+export const DEEPSEEK_ROUTE = { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+
+/**
+ * The fourth reported turn (discussion #9402): a *complete* response whose only
+ * content is a Tool call whose streamed arguments never become valid JSON.
+ *
+ * Not transcribed. `test/deepseek-malformed.spec.mjs` replays the same corrupt
+ * SSE turn through the installed `@deepseek-ai/dsh-llm-deepseek` and the real
+ * `LlmRuntime`, and asserts the drained stream equals this array element for
+ * element — so the fixture is a reading of the installed adapter, and an adapter
+ * that stops yielding any of these chunks fails there rather than quietly
+ * redefining what this suite is about.
+ *
+ * The first three chunks are the adapter's own (`content_block_start` →
+ * a name-bearing delta → the `input_json_delta` → `content_block_stop`); the
+ * finish is the one `LlmRuntime.adapterStream` synthesizes in place of the
+ * adapter's throw, which is where the plugin first sees the failure. The usage
+ * chunk a successful turn would carry is absent, because the throw happens
+ * before it.
+ */
+export const MALFORMED_TOOL_TURN = [
+  { type: 'block-start', index: 0, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'read_file', argumentsDelta: '' },
+  { type: 'tool-call-delta', index: 0, id: 'call_1', argumentsDelta: '{"path":' },
+  { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_1', name: 'read_file', arguments: '{"path":' } },
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        message: 'DeepSeek Messages stream: tool input is invalid JSON',
+        code: 'MALFORMED_RESPONSE',
+      },
+    },
+  },
+]
+
+/**
+ * The control arm the fourth recognition needs: the same chunks and the same
+ * failure, beside a Tool call whose arguments parse.
+ *
+ * This is a real shape, not a contrived one. The adapter validates every Tool
+ * call at `message_stop` and throws on the first one it cannot read, so a
+ * response with two calls — the first readable, the second corrupt — arrives at
+ * this seam exactly like this: a readable block-end, a corrupt one, and a
+ * `MALFORMED_RESPONSE` finish. The plugin's claim is about the *attempt*
+ * ("its only output was unreadable calls"), so it must decline here, and a
+ * mutant that reads the code instead of the shape is what this arm catches.
+ *
+ * The successful shape — where the adapter accepts the call and the turn ends
+ * `tool-calls` instead — is asserted against the installed adapter in
+ * `test/deepseek-malformed.spec.mjs`.
+ */
+export const PARSEABLE_TOOL_TURN = [
+  { type: 'block-start', index: 0, blockType: 'tool-call' },
+  { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'read_file', argumentsDelta: '' },
+  { type: 'tool-call-delta', index: 0, id: 'call_1', argumentsDelta: '{"path":"README.md"}' },
+  { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_1', name: 'read_file', arguments: '{"path":"README.md"}' } },
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        message: 'DeepSeek Messages stream: tool input is invalid JSON',
+        code: 'MALFORMED_RESPONSE',
+      },
+    },
+  },
+]
+
+/**
+ * The evidence a scripted turn leaves behind, as the guard folds it.
+ *
+ * The chunks before the terminal finish are handed to the plugin's own
+ * `recordAttemptOutput`, so a spec that asks `classifyEmptyAttempt` about a turn
+ * asks about the evidence that turn actually produces rather than about a
+ * hand-written stand-in. `NO_OUTPUT` is the seed, matching the guard.
+ * @param chunks - any scripted turn from this file.
+ * @returns the folded evidence of everything before its finish.
+ */
+export function outputOf(chunks) {
+  let output = plugin.NO_OUTPUT
+  for (const chunk of chunks) {
+    if (chunk.type === 'finish') break
+    output = plugin.recordAttemptOutput(output, chunk)
+  }
+  return output
+}
+
 /** An adapter that replays one scripted turn, and records how often it was asked. */
 export class ScriptedAdapter extends LlmAdapter {
   calls = 0

@@ -3,7 +3,7 @@
 Makes an **unattributable model failure** retryable — for the one seam that sees
 an attempt and everything it produced.
 
-Answers three reports of the same missing evidence:
+Answers four reports of the same missing evidence:
 
 - [deepseek-ai/deepseek-harness discussion #8321](https://github.com/deepseek-ai/deepseek-harness/discussions/8321)
   — an empty response the adapter could not name at all (`PI_AI_ERROR`).
@@ -13,6 +13,9 @@ Answers three reports of the same missing evidence:
 - [deepseek-ai/deepseek-harness discussion #9397](https://github.com/deepseek-ai/deepseek-harness/discussions/9397)
   — a wording **pi-ai itself retries** that the adapter's rule chain cannot
   place, so it falls to the same catch-all.
+- [deepseek-ai/deepseek-harness discussion #9402](https://github.com/deepseek-ai/deepseek-harness/discussions/9402)
+  — a Tool call whose streamed arguments never became JSON, so the adapter threw
+  `MALFORMED_RESPONSE` and the turn ended with nothing durable on it.
 
 ```sh
 npm install @argszero/cordis-plugin-empty-response-retry
@@ -22,11 +25,13 @@ npm install @argszero/cordis-plugin-empty-response-retry
 
 ## The gap
 
-There are three ways an attempt reaches the retry executor under a code nobody
-can act on, and each was reported separately (#8321, #9352 and #9397). This
-plugin handles all three, because they are one fact: **the code was chosen
+There are four ways an attempt reaches the retry executor under a code nobody
+can act on, and each was reported separately (#8321, #9352, #9397 and #9402).
+This plugin handles all four, because they are one fact: **the code was chosen
 without a diagnosis that names what actually failed** — and, in the third case,
-the diagnosis existed upstream and was simply not carried across.
+the diagnosis existed upstream and was simply not carried across, while in the
+fourth the adapter did name something, but named its own reading of the bytes
+rather than anything that happened at the provider.
 
 ### Report #8321: the adapter could not name the wording at all
 
@@ -214,7 +219,7 @@ Only the code changes. The provider's message, `status` and
 where a maintainer reads what the provider said and the code is the only field
 the policy reads.
 
-"Unattributed" has three shapes, and they are one principle — *a code chosen
+"Unattributed" has four shapes, and they are one principle — *a code chosen
 without a diagnosis that names what actually failed*:
 
 1. **`PI_AI_ERROR`** — the adapter's catch-all. No rule matched the provider's
@@ -252,6 +257,50 @@ without a diagnosis that names what actually failed*:
    a `SERVER` the adapter reports for a real `503` is repeated whether or not the
    stream got as far as a token. The third recognition restores that
    classification; it does not invent a stricter one.
+4. **`MALFORMED_RESPONSE` refused for arguments the adapter could not read.** The
+   one recognition whose code the adapter *did* choose — but for a refusal about
+   serialization rather than about the request. This is `unparseableCallCodes`
+   (default: `MALFORMED_RESPONSE` alone), for report #9402:
+
+   ```ts
+   // before — the Tool call never became JSON, so the adapter threw at message_stop
+   { type: 'block-start', index: 0, blockType: 'tool-call' }
+   { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'read_file', argumentsDelta: '{"path":' }
+   { type: 'block-end', index: 0, block: { type: 'tool-call', id: 'call_1',
+     name: 'read_file', arguments: '{"path":' } }
+   { type: 'finish', reason: { kind: 'error', failure: {
+     code: 'MALFORMED_RESPONSE',
+     message: 'DeepSeek Messages stream: tool input is invalid JSON' } } }
+
+   // …and after — same chunks, and only the code changes
+   { type: 'finish', reason: { kind: 'error', failure: {
+     code: 'EMPTY_RESPONSE',
+     message: 'DeepSeek Messages stream: tool input is invalid JSON' } } }
+   ```
+
+   Its gate is the strongest of the four, and it is a fact about the *attempt*
+   rather than about the failure, so it lives in the decision rather than in the
+   code list: **every Tool call the attempt assembled must be one the adapter
+   cannot read, at least one must exist, and no text or reasoning may have
+   arrived beside them.** A `MALFORMED_RESPONSE` that never assembled a Tool call
+   at all — an undecodable SSE envelope, a duplicate `message_start`, a delta
+   with no open block, a typed field of the wrong type — is declined here,
+   because the plugin will not report a shape it did not observe. So is one that
+   assembled a readable call beside the corrupt one (the adapter validates in
+   order and throws on the first it cannot read, so such a turn exists), and so
+   is one that streamed text first. All three keep the adapter's own code.
+
+   The reading of "unreadable" is the adapter's own, quoted from its
+   `message_stop` branch: `JSON.parse`, then a plain record. The second half is
+   not decoration — its `object()` helper rejects `null`, an array, a string and
+   a number as firmly as it rejects a syntax error. `test/deepseek-malformed.spec.mjs`
+   holds the two predicates against each other over a table of argument strings,
+   running both: the adapter's verdict from its stream, the plugin's from the
+   exported function.
+
+   The raw arguments are not lost by declining to look further — the attempt is
+   recorded before the failure, so the corrupt JSON is durable in
+   `assistant/attempt.stream` and a retry loses nothing (#9402, ask 3).
 
 Every recognition consults `vetoMessages` first — the alternatives pi-ai declares
 non-retryable (its `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`: quota, billing,
@@ -259,12 +308,13 @@ subscription limits) — because pi-ai itself declines those **before** it consu
 the retryable table, and a limit that resets in hours is not the safe repeat this
 principle is about.
 
-This is the **structural** fix all three reports preferred over adding one more
+This is the **structural** fix all four reports preferred over adding one more
 regex to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352),
 every one of which enumerated a new wording. It is at the layer that actually
 knows how much was produced, and it is wording-independent in the sense that
 matters: for the first two recognitions it never asks *what the provider said*,
-only *whether anyone said anything*.
+only *whether anyone said anything*, and the fourth asks not what the failure
+means but what the attempt actually assembled.
 
 For the second recognition the message gate is unavoidable — `INVALID_REQUEST` is
 also the correct code for a genuine malformed request, and only the message can
@@ -319,6 +369,13 @@ producer in the same voice is caught by the suite rather than in the field.
   predicate, which answers a different question — what a transcript reader sees —
   and therefore treats Tool calls as protocol rather than content. A Tool call is
   durable, so a durability test must not ignore it.
+- **A `MALFORMED_RESPONSE` that is not the fourth shape.** A refusal that never
+  assembled a Tool call, a turn that assembled a call the adapter *could* read
+  beside the corrupt one, and a turn that streamed text or reasoning first are
+  all left with the adapter's own code. The fourth recognition is the only one
+  whose code the adapter chose deliberately, so it is the only one that has to
+  argue from what the attempt assembled rather than from the code alone — see
+  the four-shape list above.
 - **The failure is one the adapter named from something the provider said.**
   `AUTH`, `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`,
   `RATE_LIMIT` and the rest are somebody else's to recover from. Only codes
@@ -383,12 +440,16 @@ code, and the provider's message.
 | `transientCodes` | `['PI_AI_ERROR']` | Failure codes whose message is checked against pi-ai's own retry table — the third recognition (#9397). |
 | `transientMessages` | the server-shaped half of pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN` at the version checked in `test/packaging.spec.mjs` | Regular-expression sources; a failure whose code is in `transientCodes` and whose message matches one is rewritten to `transientTargetCode`. |
 | `transientTargetCode` | `'SERVER'` | Code written for the third recognition — the name the classifier would have chosen had the wording carried the status number. |
+| `unparseableCallCodes` | `['MALFORMED_RESPONSE']` | Failure codes the fourth recognition (#9402) may consider — admitted on the code, then gated on the attempt's whole output being Tool calls the adapter cannot read. |
 | `vetoMessages` | pi-ai's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription limits) | Regular-expression sources; a failure whose message matches any is left alone, on **every** recognition. Consulted before the retryable list, as pi-ai itself does. |
 | `exceptMessages` | `['^pi-ai ']` | Regular-expression sources; a failure whose message matches any is left exactly as the adapter wrote it. |
-| `targetCode` | `'EMPTY_RESPONSE'` | Code written on a widened finish by the first two recognitions. |
+| `targetCode` | `'EMPTY_RESPONSE'` | Code written on a widened finish by the first two and the fourth recognitions. |
 
 A code listed in both `codes` and `statusOnlyCodes` is widened unconditionally,
-as `codes` describes — there is nothing left to gate.
+as `codes` describes — there is nothing left to gate. The same holds for a code
+listed in both `codes` and `unparseableCallCodes`: the fourth recognition's shape
+gate belongs to *its* recognition, and an operator who listed a code under `codes`
+has asked for admission on the code alone.
 
 Every field is validated at mount time and a bad value throws rather than
 silently disabling the guard.
@@ -406,10 +467,13 @@ plugins:
 ## Design notes
 
 **Streaming-preserving by construction.** The verdict needs only the terminal
-chunk and one boolean accumulated from the chunks before it, so nothing is
+chunk and a four-field record accumulated from the chunks before it, so nothing is
 buffered: every chunk is yielded the moment it arrives, chunk objects are passed
 through by identity, and at most the last one is rewritten. The guard never
-reorders, never delays, and keeps no state between attempts.
+reorders, never delays, and keeps no state between attempts — the record is a
+local of one pass over one stream, and two overlapping attempts each fold their
+own (a Tool call is judged at the `block-end` the adapter assembled, which is the
+one chunk that carries the complete arguments).
 
 **The rewrite is a copy, not a mutation.** The chunk a listener receives may be
 frozen (a loop-built request arrives deep-frozen), and every other listener on
@@ -443,6 +507,19 @@ Verified by running this suite against each line — `0.1.6`, `0.1.7` and `0.2.0
 (`npm run test:probe-lines`, which installs the newest published build of every
 `||` segment and re-runs the whole suite there). A line is not listed until it has
 been run.
+
+One honest qualification, measured on 2026-10-11: on the two oldest lines the
+**behaviour** arms all pass, and two arms of `test/packaging.spec.mjs` do not.
+Both of those arms assert properties of the *installed* `@earendil-works/pi-ai`
+retry table — that each shipped `transientMessages` source is still an alternative
+pi-ai carries, and that the classifier's table is at least 24 alternatives wider
+than the adapter's rule chain. Those two lines install pi-ai `0.85.1`; the
+`0.2.0-rc` line installs `0.87.1`; the shipped defaults and the floor were derived
+from `0.87.1`, where pi-ai's table is the larger of the two. So the arms are
+version-scoped assertions being asked about a version they were not measured on —
+a defect in the suite, not in the plugin, and not something this release changes
+(the same two arms fail identically on `0.3.0`'s published source). Widening them
+to be version-aware is the next change to this package.
 
 Requires Node `^22.19 || >=24`. There are no runtime dependencies.
 
