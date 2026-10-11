@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import semver from 'semver'
 
-import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, DEFAULT_TRANSIENT_MESSAGES, DEFAULT_TRANSIENT_TARGET_CODE, DEFAULT_UNPARSEABLE_CALL_CODES, DEFAULT_VETO_MESSAGES, resolveConfig } from '../lib/index.js'
+import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, DEFAULT_TRANSIENT_MESSAGES, DEFAULT_TRANSIENT_TARGET_CODE, DEFAULT_UNPARSEABLE_CALL_CODES, DEFAULT_VETO_MESSAGES, NEWER_LINE_TRANSIENT_MESSAGES, resolveConfig } from '../lib/index.js'
 import { REPORTED_STATUS_ONLY_TURN, REPORTED_TRANSIENT_TURN, clientSentence, observedMessage } from './harness.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -334,6 +334,7 @@ test('the README documents every recognition and every gate', () => {
     '#8321', '#9352', '#9397', '#9402',
     'statusOnlyCodes', 'statusOnlyMessages',
     'transientCodes', 'transientMessages', 'transientTargetCode',
+    'NEWER_LINE_TRANSIENT_MESSAGES',
     'unparseableCallCodes',
     'vetoMessages',
     'PI_AI_ERROR', 'INVALID_REQUEST', 'SERVER', 'MALFORMED_RESPONSE',
@@ -349,6 +350,48 @@ test('the README documents every recognition and every gate', () => {
 
 /** The path of the installed pi-ai module that builds both retry tables. */
 const piAiRetry = fileURLToPath(import.meta.resolve('@earendil-works/pi-ai/utils/retry'))
+
+/**
+ * The installed pi-ai's own version, read from the manifest beside the module.
+ *
+ * Read as a file rather than imported, because pi-ai's `exports` map does not
+ * publish `./package.json`. The path is derived from
+ * {@link piAiRetry} (`dist/utils/retry.js` → `../../package.json`) and the
+ * `name` is checked, so a resolution that started somewhere else fails here
+ * rather than silently reporting the version of the wrong package.
+ */
+function installedPiAiVersion() {
+  const manifestPath = resolve(dirname(piAiRetry), '..', '..', 'package.json')
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  assert.equal(manifest.name, '@earendil-works/pi-ai', `expected pi-ai's manifest at ${manifestPath}, saw ${manifest.name}`)
+  return manifest.version
+}
+
+/**
+ * The pi-ai release that added the wordings in
+ * {@link NEWER_LINE_TRANSIENT_MESSAGES}.
+ *
+ * Measured, not assumed: `0.85.1` carries 47 alternatives and `0.87.0` carries
+ * 49, and the two extras are exactly `currently experiencing high demand` and a
+ * bare `520`. There is no `0.86` release for the boundary to sit in.
+ */
+const NEWER_LINE_WORDING_RELEASE = '0.87.0'
+
+/** Whether the installed pi-ai's table is new enough to carry the newer-line wordings. */
+function carriesNewerLineWordings() {
+  return semver.gte(installedPiAiVersion(), NEWER_LINE_WORDING_RELEASE)
+}
+
+/**
+ * The smallest gap any supported line produces, and this suite's floor.
+ *
+ * `0.85.1` (the `0.1.6` and `0.1.7` lines): 47 alternatives, the chain places
+ * 24, gap 23. `0.87.1` (the `0.2.0-rc` line): 49 alternatives, the chain places
+ * 25, gap 24. The floor is the smaller of the two, so the arm holds on whichever
+ * line was installed — a floor measured on the newest line is a floor the oldest
+ * line fails.
+ */
+const SMALLEST_GAP = 23
 
 /**
  * One `buildProviderErrorPattern([...])` alternative list, as the installed
@@ -395,11 +438,27 @@ test('every shipped transient wording is one pi-ai retries and the installed cla
   const retryable = piAiTable('RETRYABLE_PROVIDER_ERROR_PATTERN')
   assert.ok(retryable.length >= 40, `expected pi-ai's retry table, saw ${retryable.length} alternatives`)
   for (const source of DEFAULT_TRANSIENT_MESSAGES) {
+    const sample = sampleOf(source)
+    assert.ok(new RegExp(source, 'i').test(sample), `${JSON.stringify(source)} does not even match its own sample`)
+    assert.equal(classify(sample), 'PI_AI_ERROR', `the installed classifier places ${JSON.stringify(sample)}, so this plugin has nothing to restore for it`)
+    if (NEWER_LINE_TRANSIENT_MESSAGES.includes(source)) {
+      // Quoted from a table only a NEWER line has, so which way the installed
+      // table goes is the assertion — and it is what makes the entry's name
+      // true rather than decorative. On a line that carries it, the citation
+      // must hold exactly as it does for the shared entries; on one that does
+      // not, the installed pi-ai must genuinely decline the wording, because
+      // that is the widening this plugin admits to on the older lines.
+      if (carriesNewerLineWordings()) {
+        assert.ok(retryable.includes(source), `the installed pi-ai carries this line's table but not ${JSON.stringify(source)}, which this plugin lists as a newer-line entry`)
+        assert.ok(await piAiRetryable(sample), `pi-ai does not retry ${JSON.stringify(sample)}; widening it would not be restoring pi-ai's judgement`)
+      } else {
+        assert.ok(!retryable.includes(source), `the installed pi-ai carries ${JSON.stringify(source)}, so it is not a newer-line-only entry on this line`)
+        assert.ok(!await piAiRetryable(sample), `pi-ai retries ${JSON.stringify(sample)} on a line whose table does not list it`)
+      }
+      continue
+    }
     assert.ok(retryable.includes(source), `pi-ai's retry table no longer carries ${JSON.stringify(source)} — this plugin is shipping a wording upstream dropped`)
-    const message = sampleOf(source)
-    assert.ok(new RegExp(source, 'i').test(message), `${JSON.stringify(source)} does not even match its own sample`)
-    assert.ok(await piAiRetryable(message), `pi-ai does not retry ${JSON.stringify(message)}; widening it would not be restoring pi-ai's judgement`)
-    assert.equal(classify(message), 'PI_AI_ERROR', `the installed classifier places ${JSON.stringify(message)}, so this plugin has nothing to restore for it`)
+    assert.ok(await piAiRetryable(sample), `pi-ai does not retry ${JSON.stringify(sample)}; widening it would not be restoring pi-ai's judgement`)
   }
 })
 
@@ -427,17 +486,32 @@ test('the two tables still disagree, and this plugin still covers the half it cl
   // is a floor, not a measurement — a sample is a sample — and it exists so a
   // quiet upstream rewrite that *closes* the gap, or widens it, is visible here
   // rather than discovered as a stale default in the field.
+  //
+  // The floor is the SMALLEST the gap gets across the supported lines, because
+  // this arm runs on whichever line was installed and the gap moves with the
+  // table: `0.85.1` carries 47 alternatives and the chain places 24 of them
+  // (gap 23), `0.87.1` carries 49 and places 25 (gap 24, one of them the `5xx`
+  // literal upstream added, which the chain's own `/\b5\d\d\b/` rule reaches).
+  // A floor measured on the newest line is a floor the oldest line fails — the
+  // version-scoping this arm was fixed for on 2026-10-11.
   const classify = await installedClassifier()
   const retryable = piAiTable('RETRYABLE_PROVIDER_ERROR_PATTERN')
   const placeable = new Set(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
   const unplaced = retryable.filter((source) => !placeable.has(classify(sampleOf(source))))
   assert.ok(
-    unplaced.length >= 24,
-    `expected at least 24 pi-ai-retryable wordings the classifier cannot place, saw ${unplaced.length}: ${unplaced.join(', ')}`,
+    unplaced.length >= SMALLEST_GAP,
+    `expected at least ${SMALLEST_GAP} pi-ai-retryable wordings the classifier cannot place, saw ${unplaced.length}: ${unplaced.join(', ')}`,
   )
   // And what this plugin restores is a strict subset of that gap — the
   // server-shaped wordings, which is the half that has a name it can defend.
+  // Membership is asserted per line for the newer-line entry, because on a line
+  // whose table predates it the wording is not in `retryable` at all and so
+  // cannot be in the gap `unplaced` filters out of it.
   for (const source of DEFAULT_TRANSIENT_MESSAGES) {
+    if (NEWER_LINE_TRANSIENT_MESSAGES.includes(source) && !carriesNewerLineWordings()) {
+      assert.ok(!unplaced.includes(source), `${JSON.stringify(source)} is in this line's gap, so it is not a newer-line-only entry on this line`)
+      continue
+    }
     assert.ok(unplaced.includes(source), `${JSON.stringify(source)} is no longer part of the gap`)
   }
   assert.ok(DEFAULT_TRANSIENT_MESSAGES.length < unplaced.length, 'the default list is a narrowing of the gap, not a copy of it')

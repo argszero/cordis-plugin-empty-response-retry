@@ -279,6 +279,20 @@ const MUTATIONS = [
     replace: "  const unparseableCallCodes = stringList('unparseableCallCodes', undefined, DEFAULT_UNPARSEABLE_CALL_CODES)\n",
     caughtBy: 'widenBasis: the fourth recognition is admitted on its code…',
   },
+  {
+    name: 'a shipped transient wording is reworded, so it no longer quotes the installed pi-ai table',
+    file: 'src/index.ts',
+    find: "  'overloaded',\n  'service.?unavailable',\n",
+    replace: "  'overload-ed',\n  'service.?unavailable',\n",
+    caughtBy: 'every shipped transient wording is one pi-ai retries… (the membership half, which runs on whichever line is installed)',
+  },
+  {
+    name: 'the newer-line half is emptied and folded into the shared list, so the runtime default loses the entry',
+    file: 'src/index.ts',
+    find: "export const NEWER_LINE_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([\n  'currently experiencing high demand',\n])",
+    replace: 'export const NEWER_LINE_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([])',
+    caughtBy: 'the shipped transient and veto defaults are the ones pi-ai&#39;s own tables carry (the split half)',
+  },
 ]
 
 const argv = process.argv.slice(2)

@@ -20,6 +20,7 @@ import {
   DEFAULT_TRANSIENT_TARGET_CODE,
   DEFAULT_UNPARSEABLE_CALL_CODES,
   DEFAULT_VETO_MESSAGES,
+  NEWER_LINE_TRANSIENT_MESSAGES,
   NO_OUTPUT,
   apply as applyPlugin,
   chunkCarriesContent,
@@ -586,6 +587,20 @@ test('the shipped transient and veto defaults are the ones pi-ai&#39;s own table
   assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('exceeded request buffer limit while retrying upstream'))
   assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('overloaded'))
   assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('service.?unavailable'))
+  // The provenance split is a claim about the RUNTIME default, so it is checked
+  // here as well as in the packaging arms: the newer-line entry is in the list
+  // this plugin actually applies, and it is not in the shared half. `0.5.0`
+  // introduced the split, and a split that quietly dropped the entry from the
+  // default would be a behaviour change dressed as a refactor.
+  assert.ok(NEWER_LINE_TRANSIENT_MESSAGES.length > 0, 'the newer-line half is what the packaging arms key their per-line claim on')
+  for (const source of NEWER_LINE_TRANSIENT_MESSAGES) {
+    assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes(source), `${JSON.stringify(source)} is named as a newer-line entry but is not in the runtime default`)
+  }
+  assert.deepEqual(
+    [...DEFAULT_TRANSIENT_MESSAGES].filter((source) => !NEWER_LINE_TRANSIENT_MESSAGES.includes(source)).concat([...NEWER_LINE_TRANSIENT_MESSAGES]),
+    [...DEFAULT_TRANSIENT_MESSAGES],
+    'the default list must be the shared entries followed by the newer-line half, and nothing else',
+  )
   assert.ok(DEFAULT_VETO_MESSAGES.includes('billing'))
   assert.ok(DEFAULT_VETO_MESSAGES.includes('available balance'))
   // The exclusion wording and the reported wording must not collide: the plugin

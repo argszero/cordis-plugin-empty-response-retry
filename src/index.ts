@@ -443,6 +443,40 @@ export const DEFAULT_TARGET_CODE = EMPTY_RESPONSE_CODE
 export const DEFAULT_TRANSIENT_CODES: readonly string[] = Object.freeze(['PI_AI_ERROR'])
 
 /**
+ * The wordings in {@link DEFAULT_TRANSIENT_MESSAGES} that only a NEWER supported
+ * line's pi-ai table carries.
+ *
+ * A peer range is a claim about versions, and pi-ai's table is not the same in
+ * every version the range admits. Two of the three supported lines resolve
+ * `0.85.1` and the newest resolves `0.87.1`, and the two tables differ by
+ * exactly this: `0.87.1` adds `currently experiencing high demand` and a bare
+ * `520`, neither of which exists at `0.85.1` (`test/packaging.spec.mjs` reads
+ * the installed table and holds that split as an assertion, on whichever line is
+ * installed).
+ *
+ * Splitting the two is what keeps the default list honest on both: every other
+ * entry is quoted verbatim from a table *every* supported line has, so the
+ * suite can re-derive it on any of them, while the entries here are quoted from
+ * a table only the newest line has — a fact the suite can state per line instead
+ * of asserting once against a version most users are not running.
+ *
+ * The direction of the difference is worth naming, because it is the one place
+ * this plugin's rewrite is wider than the table of the pi-ai actually installed:
+ * on a `0.1.x` line a failure worded `currently experiencing high demand` is
+ * **not** one that line's pi-ai would retry, and this plugin makes it retryable
+ * anyway. That is deliberate — upstream reached the same judgement one minor
+ * later, on the same server-overload class the whole recognition is for, and the
+ * recognition's gate is the code and the wording rather than the emission, so
+ * the failure it acts on is a route that could not serve the request. An
+ * operator who would rather stay strictly inside their own line's table removes
+ * the entry by name (`transientMessages` replaces the list, so the list to pass
+ * is {@link DEFAULT_TRANSIENT_MESSAGES} without it).
+ */
+export const NEWER_LINE_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([
+  'currently experiencing high demand',
+])
+
+/**
  * Default wordings, taken from pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN`.
  *
  * The adapter's classifier is a partial transcription of that table
@@ -464,13 +498,19 @@ export const DEFAULT_TRANSIENT_CODES: readonly string[] = Object.freeze(['PI_AI_
  * operator whose traffic hits them adds them here and points
  * `transientTargetCode` at `TRANSPORT` or `RATE_LIMIT`.
  *
- * The list is anchored to `0.87.1`, the release the report ran (`dsh-llm-pi-ai`
- * resolves it transitively, so it is also the one the suite reads). Upstream's
- * newer tables add `server_busy`, `servers are currently busy`, `model is at
- * capacity`, `pending stream has been canceled` and the two
+ * The entries are quoted from the tables the supported lines actually run:
+ * `0.85.1` and `0.87.1` carry every one of them but the last, and the last —
+ * {@link NEWER_LINE_TRANSIENT_MESSAGES}, which upstream added at `0.87.0` — is
+ * named separately so the suite can state its provenance per line rather than
+ * assert one version's table against another's. The list was anchored to
+ * `0.87.1` before that split, which is why the two oldest lines could not
+ * re-derive the newest entry.
+ *
+ * Upstream's newer tables add `server_busy`, `servers are currently busy`,
+ * `model is at capacity`, `pending stream has been canceled` and the two
  * `subscription_sharing_*_unavailable` alternatives; not one of them is a
- * default here, because a wording this package cannot re-derive from the table
- * it actually runs with would be a claim rather than a citation. A route on a
+ * default here, because a wording this package cannot re-derive from a table a
+ * supported line runs with would be a claim rather than a citation. A route on a
  * newer line adds them by name.
  *
  * Patterns are compiled case-insensitively ({@link DEFAULT_VETO_MESSAGES} and
@@ -479,12 +519,12 @@ export const DEFAULT_TRANSIENT_CODES: readonly string[] = Object.freeze(['PI_AI_
  */
 export const DEFAULT_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([
   'overloaded',
-  'currently experiencing high demand',
   'service.?unavailable',
   'server.?error',
   'internal.?error',
   'provider.?returned.?error',
   'exceeded request buffer limit while retrying upstream',
+  ...NEWER_LINE_TRANSIENT_MESSAGES,
 ])
 
 /**

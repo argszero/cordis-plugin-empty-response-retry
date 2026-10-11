@@ -36,7 +36,20 @@ import { DEEPSEEK_ROUTE, MALFORMED_TOOL_TURN } from './harness.mjs'
 
 /** The build this package pins: the one the fourth recognition was measured on. */
 const PINNED_PACKAGE = '@deepseek-ai/dsh-llm-deepseek'
-const PINNED_VERSION = '0.2.0-rc.2'
+
+/**
+ * The version of the adapter actually installed for this run.
+ *
+ * Read from the installed package rather than from a literal, because the line
+ * under test is not always the line this manifest pins: `npm run
+ * test:probe-lines` rewrites the manifest's `devDependencies` to the line being
+ * probed and re-runs this suite there. A literal here would fail on every line
+ * but one while proving nothing about the adapter that was installed — and the
+ * skip it feeds would then name a version that is not under test.
+ */
+const INSTALLED_VERSION = JSON.parse(
+  await readFile(new URL(import.meta.resolve(`${PINNED_PACKAGE}/package.json`)), 'utf8'),
+).version
 
 /** One SSE body from a list of Anthropic-shaped events. */
 const sse = (events) => events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join('')
@@ -66,7 +79,16 @@ const corruptTurn = (partialJson) => [
 function installedAdapter() {
   return new DeepSeekAdapter({
     options: () => resolveAdapterOptions({ apiKey: 'test-key', baseURL: 'http://127.0.0.1:1/anthropic' }),
+    // The credential hook was renamed upstream, and both spellings are supplied
+    // rather than version-detected: the adapter reads exactly one of them and
+    // ignores the other, so the older shape (`resolveApiKey`, returning the key)
+    // and the newer (`resolveAuth`, returning headers) both wire without this
+    // suite having to know which line installed. Supplying only the newer one is
+    // what made the two oldest lines fail — the adapter called `undefined` as a
+    // credential resolver and the turn died as `TRANSPORT`, one layer above the
+    // refusal this file is about.
     resolveAuth: () => Promise.resolve({ headers: { 'x-api-key': 'test-key' } }),
+    resolveApiKey: () => Promise.resolve('test-key'),
     resolveUserId: () => 'test-user',
     resolveAttachments: () => undefined,
     resolveImageAccess: () => undefined,
@@ -117,7 +139,7 @@ const failureOf = (chunks) => chunks.at(-1)?.reason?.kind === 'error' ? chunks.a
 const refusesUnreadableCalls = failureOf(await installedTurn('{"path":', false))?.code === 'MALFORMED_RESPONSE'
 
 /** The reason a skip would give, quoted in every arm that depends on the refusal. */
-const SKIP = `the installed ${PINNED_VERSION} build does not refuse unreadable Tool arguments at message_stop, so the #9402 shape cannot occur on this line`
+const SKIP = `the installed ${PINNED_PACKAGE}@${INSTALLED_VERSION} build does not refuse unreadable Tool arguments at message_stop, so the #9402 shape cannot occur on this line`
 
 test('the installed adapter still produces the #9402 turn, chunk for chunk', { skip: refusesUnreadableCalls ? false : SKIP }, async () => {
   // The fixture is a reading of the installed adapter, held here: if a build
@@ -184,18 +206,21 @@ test('the plugin’s acceptance predicate is the installed adapter’s own, over
   }
 })
 
-test('the pinned build is the one the refusal was measured on', async () => {
+test('the installed build is the one the manifest pins, and it refuses', async () => {
   // Without this arm the skip above could hide the whole suite on the line this
   // package ships for. `package.json` is the contract for that line, and the
-  // adapter under test is whatever npm installed for it.
+  // adapter under test is whatever npm installed for it — so the assertion is
+  // that those two agree, not that either equals a literal written here. A
+  // literal would pass on exactly one line and fail on the lines the probe
+  // rewrites the manifest for, which is when it would be least informative.
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'))
   assert.equal(
+    INSTALLED_VERSION,
     manifest.devDependencies[PINNED_PACKAGE],
-    PINNED_VERSION,
-    `the pinned adapter line moved to ${manifest.devDependencies[PINNED_PACKAGE]}; the skip this suite argues against is written for ${PINNED_VERSION}`,
+    `the adapter under test is ${PINNED_PACKAGE}@${INSTALLED_VERSION}, which is not the build the manifest pins`,
   )
   assert.ok(
     refusesUnreadableCalls,
-    `the pinned ${PINNED_PACKAGE}@${PINNED_VERSION} build must refuse unreadable Tool arguments — the fourth recognition exists for it`,
+    `the installed ${PINNED_PACKAGE}@${INSTALLED_VERSION} build must refuse unreadable Tool arguments — the fourth recognition exists for it`,
   )
 })

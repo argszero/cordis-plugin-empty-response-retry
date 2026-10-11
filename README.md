@@ -161,21 +161,25 @@ exceeded` — and means the opposite. That rule's own comment says why:
 The observation generalizes. **pi-ai decides retryability from a table of its
 own, and the harness adapter's classifier is a second, partial transcription of
 it.** `isRetryableAssistantError` (`@earendil-works/pi-ai/dist/utils/retry.js`)
-tests the message against `RETRYABLE_PROVIDER_ERROR_PATTERN` — 49 alternatives at
-`0.87.1` (the reporter's version), 55 at `1.1.0` — *after* declining anything matching
-`NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription
-limits). Measured against the installed table:
+tests the message against `RETRYABLE_PROVIDER_ERROR_PATTERN` — 47 alternatives at
+`0.85.1`, 49 at `0.87.1` (the reporter's version), 55 at `1.1.0` — *after*
+declining anything matching `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota,
+billing, subscription limits). Measured against the installed table:
 
 | | alternatives | the chain places | **it cannot place** |
 |---|---|---|---|
-| `0.87.1` | 49 | 25 | **24** |
+| `0.85.1` (the `0.1.6` / `0.1.7` lines) | 47 | 24 | **23** |
+| `0.87.1` (the `0.2.0-rc` line) | 49 | 25 | **24** |
 | `1.1.0` | 55 | 25 | **30** |
 
 Every unplaceable one falls to the catch-all and is never repeated — this
 report's sentence beside `overloaded`, `service unavailable`, `too many requests`,
 `getaddrinfo`, `ENOTFOUND`, `reset before headers` and the rest. `test/packaging.spec.mjs`
 holds that measurement as an assertion against the installed package, so a quiet
-upstream rewrite that closes the gap is visible rather than discovered.
+upstream rewrite that closes the gap is visible rather than discovered — and the
+floor it asserts is the **smallest** gap across the supported lines (`23`, at
+`0.85.1`), because the arm runs on whichever line was installed and the gap moves
+with the table.
 
 The report's framing — *one more wording in the `SERVER` rule* — would fix one
 line of that table. The framing here is the direction the two tables were built
@@ -232,8 +236,8 @@ without a diagnosis that names what actually failed*:
 3. **`PI_AI_ERROR` whose message is a wording pi-ai itself retries.** A third
    case, and the widest of the three: the adapter could not place the wording, but
    pi-ai could — the harness's classifier is a second, partial transcription of
-   the SDK's own retry table, and the gap between them is 24 wordings at `0.87.1`
-   and 30 at `1.1.0` (see report #9397 above). This is `transientCodes` (default:
+   the SDK's own retry table, and the gap between them is 23 wordings at `0.85.1`,
+   24 at `0.87.1` and 30 at `1.1.0` (see report #9397 above). This is `transientCodes` (default:
    `PI_AI_ERROR`), `transientMessages` (the server-shaped alternatives) and
    `transientTargetCode` (default: `SERVER`, the code the chain *would* have
    written had the rule seen the digits the gateway dropped):
@@ -438,7 +442,7 @@ code, and the provider's message.
 | `statusOnlyCodes` | `['INVALID_REQUEST']` | Failure codes widened **only** when the message is the HTTP client's own bodyless status line. |
 | `statusOnlyMessages` | the client's `… status code (no body)` sentence, and an empty JSON container | Regular-expression sources; a failure whose code is in `statusOnlyCodes` is widened only when its message matches one. Anchored at the end of the message. |
 | `transientCodes` | `['PI_AI_ERROR']` | Failure codes whose message is checked against pi-ai's own retry table — the third recognition (#9397). |
-| `transientMessages` | the server-shaped half of pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN` at the version checked in `test/packaging.spec.mjs` | Regular-expression sources; a failure whose code is in `transientCodes` and whose message matches one is rewritten to `transientTargetCode`. |
+| `transientMessages` | the server-shaped half of pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN`, at every version the supported lines resolve | Regular-expression sources; a failure whose code is in `transientCodes` and whose message matches one is rewritten to `transientTargetCode`. One entry (`currently experiencing high demand`, upstream's addition at `0.87.0`) is only in the newest line's table — see `NEWER_LINE_TRANSIENT_MESSAGES` below. |
 | `transientTargetCode` | `'SERVER'` | Code written for the third recognition — the name the classifier would have chosen had the wording carried the status number. |
 | `unparseableCallCodes` | `['MALFORMED_RESPONSE']` | Failure codes the fourth recognition (#9402) may consider — admitted on the code, then gated on the attempt's whole output being Tool calls the adapter cannot read. |
 | `vetoMessages` | pi-ai's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription limits) | Regular-expression sources; a failure whose message matches any is left alone, on **every** recognition. Consulted before the retryable list, as pi-ai itself does. |
@@ -508,18 +512,53 @@ Verified by running this suite against each line — `0.1.6`, `0.1.7` and `0.2.0
 `||` segment and re-runs the whole suite there). A line is not listed until it has
 been run.
 
-One honest qualification, measured on 2026-10-11: on the two oldest lines the
-**behaviour** arms all pass, and two arms of `test/packaging.spec.mjs` do not.
-Both of those arms assert properties of the *installed* `@earendil-works/pi-ai`
-retry table — that each shipped `transientMessages` source is still an alternative
-pi-ai carries, and that the classifier's table is at least 24 alternatives wider
-than the adapter's rule chain. Those two lines install pi-ai `0.85.1`; the
-`0.2.0-rc` line installs `0.87.1`; the shipped defaults and the floor were derived
-from `0.87.1`, where pi-ai's table is the larger of the two. So the arms are
-version-scoped assertions being asked about a version they were not measured on —
-a defect in the suite, not in the plugin, and not something this release changes
-(the same two arms fail identically on `0.3.0`'s published source). Widening them
-to be version-aware is the next change to this package.
+The lines do not run the same pi-ai, and until `0.5.0` the suite did not know
+that. `0.1.6` and `0.1.7` resolve `0.85.1`; `0.2.0-rc` resolves `0.87.1`; the two
+tables differ by exactly two alternatives. The shipped transient defaults and the
+gap floor had both been derived from `0.87.1`, so on the two oldest lines one
+default could not be re-derived and one floor was one short.
+
+A third arm failed for an unrelated reason, and it is the one worth naming
+because it disabled more than itself. The fixture that wires the **installed**
+adapter passed the credential hook under the name the newest line reads
+(`resolveAuth`, returning headers); the two oldest lines still call it
+`resolveApiKey`, returning the key. The adapter therefore called `undefined` as
+its credential resolver, the request died inside the transport wrapper as
+`TRANSPORT` — one layer above the `MALFORMED_RESPONSE` refusal that suite is
+about — and every arm gated on measuring that refusal went quiet rather than
+failing loudly. Three arms, two causes, and all three were the suite asking a
+question that had only ever been answered about the newest line. `0.5.0` fixes
+the suite rather than the claim:
+
+- the defaults are split into the wordings **every** supported line's table
+  carries and `NEWER_LINE_TRANSIENT_MESSAGES` — the one entry upstream added at
+  `0.87.0` (`currently experiencing high demand`);
+- the wording arms now assert provenance **per installed line**: a shared entry
+  must be in the installed table and be one pi-ai retries, while a newer-line
+  entry must be there *iff* the installed pi-ai is new enough, and must be one
+  pi-ai genuinely declines when it is not;
+- the gap floor is the smallest gap across the supported lines (`23`), not the
+  newest line's (`24`);
+- the pinned-adapter arm no longer compares a manifest field against a version
+  written in the test file — it asserts that the adapter npm **installed** is the
+  one the manifest pins, which is the invariant a probe that rewrites the manifest
+  for each line still satisfies, and the skip message now names the build actually
+  under test;
+- the adapter fixture supplies the credential hook under **both** spellings
+  (`resolveAuth` and `resolveApiKey`), because the installed adapter reads exactly
+  one of them and ignores the other — so the behaviour arms now run on every line
+  instead of being skipped on two of them.
+
+**The one place the rewrite is wider than the installed table**, stated plainly:
+on a `0.1.x` line, a failure worded `currently experiencing high demand` is not
+one that line's pi-ai would retry, and this plugin makes it retryable anyway. That
+is deliberate — upstream reached the same judgement one minor later, about the same
+server-overload class the recognition exists for, and the recognition's gate is the
+code and the wording rather than the emission, so what it acts on is a route that
+could not serve the request. An operator who would rather stay strictly inside
+their own line's table passes `transientMessages` without that entry; the export is
+`NEWER_LINE_TRANSIENT_MESSAGES`, and the runtime default is the union, so nothing
+changes for anyone who does not ask.
 
 Requires Node `^22.19 || >=24`. There are no runtime dependencies.
 
