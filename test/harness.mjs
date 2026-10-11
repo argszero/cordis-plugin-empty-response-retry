@@ -113,6 +113,30 @@ export const REPORTED_STATUS_ONLY_TURN = [
 ]
 
 /**
+ * The third reported turn (discussion #9397): a gateway's upstream-retry buffer
+ * limit. The wording carries no status number, so the classifier's `5xx` rule —
+ * which needs the digits the gateway dropped — never fires, and the failure
+ * falls to the catch-all.
+ *
+ * The sentence is the reporter's, verbatim; `test/packaging.spec.mjs` executes
+ * the *installed* classifier on it and the installed pi-ai predicate beside it,
+ * which is what makes it evidence rather than a transcription.
+ */
+export const REPORTED_TRANSIENT_TURN = [
+  { type: 'usage', usage: { inputTokens: 11, outputTokens: 0, totalTokens: 11 } },
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        message: 'exceeded request buffer limit while retrying upstream',
+        code: 'PI_AI_ERROR',
+      },
+    },
+  },
+]
+
+/**
  * The two terminal states `mapStopReason` marks deliberately non-retryable,
  * transcribed from the adapter (see `packaging.spec.mjs`, which asserts these
  * exact sentences are still what the shipped bundle writes).

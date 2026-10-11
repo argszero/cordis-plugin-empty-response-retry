@@ -82,6 +82,82 @@
  * tools, 2.26 MB — and got HTTP 200 twice, with a prompt-token count 0.07% off
  * the original. The request was never invalid.
  *
+ * ## The third report (discussion #9397), and what it turns out to be
+ *
+ * A `dsh-llm-pi-ai` route behind a gateway ended a turn with
+ *
+ * ```
+ * attempt t1s1 → error: PI_AI_ERROR exceeded request buffer limit while retrying upstream
+ * ```
+ *
+ * — the Envoy upstream-retry buffer limit, i.e. a `507` the gateway answered
+ * because it could not hold the request it was retrying. The wording matches no
+ * rule of the chain (it carries no number, and `/\b5\d\d\b/` needs the digits the
+ * gateway dropped), so it falls to the catch-all `PI_AI_ERROR`, which no retry
+ * table admits.
+ *
+ * The report frames this as one missing wording, and proposes one more
+ * alternative in the `SERVER` rule — while explicitly asking that the match stay
+ * literal, because the neighbouring `413` rule exists for a *different* failure
+ * whose text shares both words: `failed to buffer the request body: length limit
+ * exceeded`. That rule's own comment is the reason (`stream.ts`):
+ *
+ * > A rejected request body (gateway or provider size cap): resending the same
+ * > request cannot succeed, so it is invalid, not transient.
+ *
+ * The rule generalizes, and that is the finding this release acts on. **pi-ai
+ * decides retryability from a table of its own, and the harness adapter's
+ * classifier is a second, partial transcription of it.** `pi-ai`'s
+ * `isRetryableAssistantError` (`dist/utils/retry.js`) tests the message against
+ * `RETRYABLE_PROVIDER_ERROR_PATTERN` — 49 alternatives at 0.87.1, 55 at 1.1.0 —
+ * *after* declining anything matching
+ * `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription
+ * limits). `classifyPiAiError` recognizes a subset, so **24 of the 49
+ * alternatives the reporter's own table retries are wordings the chain cannot
+ * place** (30 of 55 at 1.1.0), and every one of them lands on the catch-all and
+ * is never repeated — the report's sentence is one of them, alongside
+ * `overloaded`, `service unavailable`, `too many requests`, `getaddrinfo`,
+ * `ENOTFOUND`, `reset before headers` and the rest.
+ *
+ * So the third recognition is not one more wording; it is the *direction* the
+ * two tables were built in:
+ *
+ * 3. `PI_AI_ERROR` (the catch-all again) whose message is a wording **pi-ai
+ *    itself retries**. The adapter could not place it, but pi-ai could — and
+ *    this plugin can read the same table. This is `transientMessages`, and it is
+ *    reported as `SERVER` (`transientTargetCode`), the code the chain *would*
+ *    have written had it seen the digits.
+ *
+ * It is deliberately narrower than "copy pi-ai's table". The default list keeps
+ * the alternatives whose honest reading is a **server or gateway that could not
+ * serve the request now**; the transport-shaped ones (`getaddrinfo`, `ENOTFOUND`,
+ * `EAI_AGAIN`, `reset before headers`, `ended without`, `websocket …`,
+ * `pending stream has been canceled`, …) and the throttle-shaped ones
+ * (`too many requests`, `ResourceExhausted`) are left out, because `SERVER`
+ * would be the wrong name for them and a wrong name in a durable log is the
+ * thing this plugin exists to stop writing. `transientMessages` and
+ * `transientTargetCode` are the knobs for an operator who wants them.
+ *
+ * The veto runs the same table in the other direction, and it is not an
+ * afterthought: pi-ai declines a `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`
+ * match **before** it consults the retryable one, and this plugin now does the
+ * same, on every recognition (`vetoMessages`). It also closes a hole 0.2.0 had:
+ * a billing or subscription-limit message that the harness's own
+ * `isQuotaExceededError` does not recognize (`billing`, `available balance`,
+ * `out of budget`) falls to the catch-all, and the first recognition would have
+ * repeated it. A limit that resets in hours is not the safe repeat the principle
+ * is about, and pi-ai says so first.
+ *
+ * One asymmetry is deliberate. The first two recognitions write
+ * `EMPTY_RESPONSE`, which asserts the attempt produced nothing durable, so they
+ * require that to be true. The third writes a code about the *route*, not about
+ * output — and the harness's own gate proves it needs no such condition:
+ * `dsh-llm-retry` decides on `policy.retryableCodes.includes(failure.code)` and
+ * nothing else (`packages/llm/llm-retry/src/index.ts`), so a `SERVER` reported by
+ * the adapter for a real `503` is repeated whether or not the stream got as far
+ * as a token. The third recognition restores that classification; it does not
+ * invent a stricter one.
+ *
  * ## What this plugin does
  *
  * It wraps the public `llm/stream` waterfall — the one seam that sees an attempt
@@ -93,7 +169,7 @@
  * touched: the provider's message, status and `providerRetryAfterMs` are carried
  * through, so the session log still shows what the provider said.
  *
- * "Could not attribute" has two shapes, and they are one principle — *a code
+ * "Could not attribute" has three shapes, and they are one principle — *a code
  * chosen without a provider-authored diagnosis*:
  *
  * 1. `PI_AI_ERROR`, the adapter's catch-all: no rule matched the provider's text
@@ -103,12 +179,18 @@
  *    is `statusOnlyCodes` (report #9352), gated on the message by
  *    `statusOnlyMessages` — a `400` that carries the provider's words is a
  *    diagnosis, and is left exactly as it is.
+ * 3. `PI_AI_ERROR` again, but with a message pi-ai's own retry table admits: the
+ *    adapter could not place the wording and the *upstream SDK* could. This is
+ *    `transientCodes` / `transientMessages` (report #9397), reported as `SERVER`
+ *    — the code the chain would have written had the wording carried the number
+ *    it dropped. It is the one shape that does not require an empty attempt, for
+ *    the reason given above: it names the route, not the output.
  *
- * This is the structural fix both reporters preferred over adding one more regex
- * to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352) —
- * every one of which enumerated a new wording. It is also strictly *narrower*
- * than the `retryableCodes: [..., PI_AI_ERROR]` workaround in the first report,
- * which widens every catch-all failure on a route; see the next section.
+ * This is the structural fix the reporters preferred over adding one more regex
+ * to a chain with a six-report history (#4361, #6595, #7691, #8321, #9352,
+ * #9397) — every one of which enumerated a new wording. It is also strictly
+ * *narrower* than the `retryableCodes: [..., PI_AI_ERROR]` workaround in the first
+ * report, which widens every catch-all failure on a route; see the next section.
  *
  * **What it cannot do, and does not pretend to.** The report also asks for the
  * HTTP status, headers and a body snippet to be persisted, and for a cheap
@@ -154,16 +236,25 @@
  *   harness's `isVisibleChunk` predicate, which answers a different question —
  *   what a transcript reader sees — and therefore treats Tool calls as protocol
  *   rather than content (`packages/llm/llm/src/assistant-stream.ts:260-279`). A
- *   tool call is durable, so a durability test must not ignore it.
- * - **The finish is not an error**, or is already `EMPTY_RESPONSE`, or is
- *   `aborted` (a caller cancellation is not a provider failure).
- * - **The code is not in `codes` or `statusOnlyCodes`.** A failure the adapter
- *   named from something the provider actually said — `AUTH`,
+ *   tool call is durable, so a durability test must not ignore it. This refusal
+ *   is the `EMPTY_RESPONSE` claim being checked, so it applies to the two
+ *   recognitions that make that claim and not to the transient one.
+ * - **The finish is not an error**, or is already the code it would be rewritten
+ *   to, or is `aborted` (a caller cancellation is not a provider failure).
+ * - **The code is not in `codes`, `statusOnlyCodes` or `transientCodes`.** A
+ *   failure the adapter named from something the provider actually said — `AUTH`,
  *   `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`, `RATE_LIMIT` — is
  *   somebody else's to recover from, and is left alone. `INVALID_REQUEST` is the
  *   one named code this plugin will touch, and only in its status-only form: a
  *   message carrying anything else, even two words, is a diagnosis and is
  *   declined.
+ * - **The message names a subscription limit.** `vetoMessages` is pi-ai's own
+ *   non-retryable table (`GoUsageLimitError`, `insufficient_quota`, `out of
+ *   budget`, `billing`, …), and it
+ *   is checked before every recognition — the order pi-ai itself uses
+ *   (`isRetryableAssistantError` tests the limit pattern first). It fails in the
+ *   narrow direction on purpose: a limit that resets in hours is not a transient
+ *   the retry policy should burn a budget on, however the failure got its code.
  * - **A status-only message is only widened when it is status-only.** The gate
  *   is the message (`statusOnlyMessages`), not the code, so a `400` that carries
  *   a body — the provider telling you *why* — keeps the code the adapter chose.
@@ -260,6 +351,98 @@ export const DEFAULT_STATUS_ONLY_MESSAGES: readonly string[] = Object.freeze([
 export const DEFAULT_TARGET_CODE = EMPTY_RESPONSE_CODE
 
 /**
+ * Default codes admitted by the transient recognition: the adapter's catch-all.
+ *
+ * The wording test below is what makes the recognition, so the code default is
+ * the same one the first recognition uses — the difference is that a message
+ * matching pi-ai's own retry table is no longer treated as unattributable.
+ */
+export const DEFAULT_TRANSIENT_CODES: readonly string[] = Object.freeze(['PI_AI_ERROR'])
+
+/**
+ * Default wordings, taken from pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN`.
+ *
+ * The adapter's classifier is a partial transcription of that table
+ * (`@earendil-works/pi-ai/dist/utils/retry.js`; `isRetryableAssistantError`
+ * tests it after declining the limit table). Every source below is quoted
+ * verbatim from the installed table — `test/packaging.spec.mjs` re-reads the
+ * installed package and re-derives each one, and executes the installed
+ * predicate on it, so this list cannot drift into a transcription of a table
+ * that no longer exists.
+ *
+ * The list is the *server-shaped* subset of the alternatives the chain cannot
+ * place: wordings that mean a server or gateway could not serve this request
+ * now. The throttle-shaped ones (`too many requests`, `ResourceExhausted`) and
+ * the transport-shaped ones (`getaddrinfo`, `ENOTFOUND`, `EAI_AGAIN`, `reset
+ * before headers`, `upstream connect`, `ended without`, `websocket …`,
+ * `pending stream has been canceled`, `retry delay`, the `… retry your request`
+ * family) are deliberately absent: they are transients, but `SERVER` is not
+ * their name, and the plugin will not write a name it cannot defend. An
+ * operator whose traffic hits them adds them here and points
+ * `transientTargetCode` at `TRANSPORT` or `RATE_LIMIT`.
+ *
+ * The list is anchored to `0.87.1`, the release the report ran (`dsh-llm-pi-ai`
+ * resolves it transitively, so it is also the one the suite reads). Upstream's
+ * newer tables add `server_busy`, `servers are currently busy`, `model is at
+ * capacity`, `pending stream has been canceled` and the two
+ * `subscription_sharing_*_unavailable` alternatives; not one of them is a
+ * default here, because a wording this package cannot re-derive from the table
+ * it actually runs with would be a claim rather than a citation. A route on a
+ * newer line adds them by name.
+ *
+ * Patterns are compiled case-insensitively ({@link DEFAULT_VETO_MESSAGES} and
+ * this list both), because pi-ai's own table is:
+ * `new RegExp(patterns.join('|'), 'i')`.
+ */
+export const DEFAULT_TRANSIENT_MESSAGES: readonly string[] = Object.freeze([
+  'overloaded',
+  'currently experiencing high demand',
+  'service.?unavailable',
+  'server.?error',
+  'internal.?error',
+  'provider.?returned.?error',
+  'exceeded request buffer limit while retrying upstream',
+])
+
+/**
+ * Default code for a failure admitted by the transient recognition.
+ *
+ * `SERVER` is the code `classifyPiAiError` writes for a `5xx`, and the two
+ * classes are the same failure seen from either side of a dropped digit: the
+ * gateway's `507` for the reported wording is reported to the SDK without its
+ * number, which is why the chain's own `/\b5\d\d\b/` rule never fires. It is by
+ * value here for the same reason `EMPTY_RESPONSE` is — so this plugin and the
+ * default retry policy cannot disagree about the name.
+ */
+export const DEFAULT_TRANSIENT_TARGET_CODE = 'SERVER'
+
+/**
+ * Default refusal, taken from pi-ai's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
+ *
+ * Quoted verbatim from the installed table, like the transient list above, and
+ * checked *before* every recognition — which is the order pi-ai itself uses
+ * (`isRetryableAssistantError` declines a limit match before consulting its
+ * retryable table). These are subscription and billing states: a free-tier or
+ * monthly limit that resets in hours is not the safe repeat retry policy is for.
+ *
+ * Two of them matter beyond the transient recognition. `billing` and
+ * `available balance` are not wordings the harness's own `isQuotaExceededError`
+ * (`packages/llm/llm/src/error.ts`) recognizes, so they reach this plugin on the
+ * catch-all code — where, without this check, the first recognition would have
+ * repeated a billing failure up to `maxRetries` times.
+ */
+export const DEFAULT_VETO_MESSAGES: readonly string[] = Object.freeze([
+  'GoUsageLimitError',
+  'FreeUsageLimitError',
+  'Monthly usage limit reached',
+  'available balance',
+  'insufficient_quota',
+  'out of budget',
+  'quota exceeded',
+  'billing',
+])
+
+/**
  * Default exclusion: messages the pi-ai adapter authored itself.
  *
  * Every message `mapStopReason` writes for this family starts with its own
@@ -309,6 +492,33 @@ export interface Config {
    */
   statusOnlyMessages?: string[]
   /**
+   * Failure codes admitted when the failure's message is a wording pi-ai's own
+   * retry table carries. Defaults to `['PI_AI_ERROR']`, the catch-all the
+   * adapter's partial transcription of that table leaves behind.
+   */
+  transientCodes?: string[]
+  /**
+   * Regular-expression sources; a code listed in `transientCodes` is widened
+   * only when the failure's message matches one of them. Defaults to pi-ai's
+   * server-shaped retryable wordings the harness classifier cannot place — see
+   * {@link DEFAULT_TRANSIENT_MESSAGES}. Compiled case-insensitively, as pi-ai's
+   * own table is.
+   */
+  transientMessages?: string[]
+  /**
+   * Code written on a finish widened by the transient recognition. Defaults to
+   * `SERVER`, the code the classifier writes for a `5xx` — the same failure,
+   * reported without the number that would have placed it.
+   */
+  transientTargetCode?: string
+  /**
+   * Regular-expression sources; a failure whose message matches any of them is
+   * declined, whatever its code and whichever recognition would have admitted
+   * it. Defaults to pi-ai's own non-retryable limit table — see
+   * {@link DEFAULT_VETO_MESSAGES}. Compiled case-insensitively.
+   */
+  vetoMessages?: string[]
+  /**
    * Regular-expression sources; a failure whose message matches any of them is
    * left exactly as the adapter wrote it. Defaults to `['^pi-ai ']` — the
    * adapter's own deliberate terminal states.
@@ -327,16 +537,22 @@ export interface ResolvedConfig {
   readonly codes: readonly string[]
   readonly statusOnlyCodes: readonly string[]
   readonly statusOnlyMessages: readonly RegExp[]
+  readonly transientCodes: readonly string[]
+  readonly transientMessages: readonly RegExp[]
+  readonly transientTargetCode: string
+  readonly vetoMessages: readonly RegExp[]
   readonly exceptMessages: readonly RegExp[]
   readonly targetCode: string
 }
 
-/** Why a failure's code was admitted: which of the two recognitions fired. */
+/** Why a failure's code was admitted: which of the three recognitions fired. */
 export type WidenBasis =
   /** `codes`: the adapter's catch-all — no rule matched the provider's text. */
   | 'catch-all'
   /** `statusOnlyCodes`: the rule matched only the client's bodyless status line. */
   | 'status-only'
+  /** `transientCodes`: the wording is one pi-ai's own retry table admits. */
+  | 'transient'
 
 /** One recognition, as it is logged. */
 export interface WidenEvidence {
@@ -369,21 +585,37 @@ function stringList(label: string, value: readonly string[] | undefined, fallbac
   return Object.freeze([...value])
 }
 
+/** Validate one failure-code field, failing loud on an empty or non-string value. */
+function codeName(label: string, value: string | undefined, fallback: string): string {
+  const code = value ?? fallback
+  if (typeof code !== 'string' || code.length === 0) {
+    throw new Error(`empty-response-retry: \`${label}\` must be a non-empty string`)
+  }
+  return code
+}
+
 /**
  * Compile one list of regular-expression sources, naming the field on failure.
  *
  * A pattern that does not compile must stop the mount rather than leave the
  * guard acting on a list it silently truncated: as with every other field here,
  * a broken config has to look like a broken config, not like the bug.
+ *
+ * `flags` is passed through per field rather than fixed, because each list
+ * mirrors the evidence it was taken from: the status-only gate transcribes what
+ * an HTTP client and pi-ai's error normalizer *print*, so it matches as printed,
+ * while the two pi-ai lists transcribe one `RegExp` that pi-ai itself builds
+ * with `'i'` — matching them any other way would be a different predicate.
  * @param label - the config field, as the operator wrote it.
  * @param value - the sources the operator passed, if any.
  * @param fallback - the shipped default.
+ * @param flags - regular-expression flags for this field.
  * @returns the compiled patterns, in order.
  */
-function patternList(label: string, value: readonly string[] | undefined, fallback: readonly string[]): readonly RegExp[] {
+function patternList(label: string, value: readonly string[] | undefined, fallback: readonly string[], flags = ''): readonly RegExp[] {
   return Object.freeze(stringList(label, value, fallback).map((source) => {
     try {
-      return new RegExp(source)
+      return new RegExp(source, flags)
     } catch (error) {
       throw new Error(`empty-response-retry: \`${label}\` entry ${JSON.stringify(source)} is not a valid regular expression`, { cause: error })
     }
@@ -405,16 +637,19 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   }
   const codes = stringList('codes', config.codes, DEFAULT_CODES)
   const statusOnlyCodes = stringList('statusOnlyCodes', config.statusOnlyCodes, DEFAULT_STATUS_ONLY_CODES)
-  const targetCode = config.targetCode ?? DEFAULT_TARGET_CODE
-  if (typeof targetCode !== 'string' || targetCode.length === 0) {
-    throw new Error('empty-response-retry: `targetCode` must be a non-empty string')
-  }
+  const transientCodes = stringList('transientCodes', config.transientCodes, DEFAULT_TRANSIENT_CODES)
+  const targetCode = codeName('targetCode', config.targetCode, DEFAULT_TARGET_CODE)
+  const transientTargetCode = codeName('transientTargetCode', config.transientTargetCode, DEFAULT_TRANSIENT_TARGET_CODE)
   return Object.freeze({
     mode,
     codes,
     statusOnlyCodes,
+    transientCodes,
     targetCode,
+    transientTargetCode,
     statusOnlyMessages: patternList('statusOnlyMessages', config.statusOnlyMessages, DEFAULT_STATUS_ONLY_MESSAGES),
+    transientMessages: patternList('transientMessages', config.transientMessages, DEFAULT_TRANSIENT_MESSAGES, 'i'),
+    vetoMessages: patternList('vetoMessages', config.vetoMessages, DEFAULT_VETO_MESSAGES, 'i'),
     exceptMessages: patternList('exceptMessages', config.exceptMessages, DEFAULT_EXCEPT_MESSAGES),
   })
 }
@@ -451,33 +686,67 @@ export function chunkCarriesContent(chunk: StreamChunk): boolean {
 /**
  * Decide why one failure's code is admitted, or that it is not.
  *
- * The two recognitions this plugin has, in the order they are checked:
+ * The three recognitions this plugin has, in the order they are checked:
  *
- * - `codes` (default the adapter's catch-all) is admitted unconditionally: the
- *   adapter could not name the failure, so its code carries no diagnosis to
- *   contradict.
- * - `statusOnlyCodes` (default `INVALID_REQUEST`) is admitted only when the
+ * - `transientCodes` (default the catch-all) **first**, when the message is a
+ *   wording pi-ai's own retry table carries: the most specific thing that can be
+ *   said about the failure, and the only one that names the route rather than
+ *   the output. It is checked before `codes` because a message in pi-ai's table
+ *   *is* attributed, and the catch-all's code would be the wrong name for it.
+ * - `codes` (default the catch-all) next, unconditionally: the adapter could not
+ *   name the failure, so its code carries no diagnosis to contradict.
+ * - `statusOnlyCodes` (default `INVALID_REQUEST`) last, and only when the
  *   message is nothing but the HTTP status the *client* wrote. The code is a
  *   name for the client's inability to read the response, not for anything the
  *   provider said, so the failure is as unattributed as the catch-all is.
  *
- * A code in both lists is admitted the first way; there is nothing to gate.
+ * The veto precedes all three. pi-ai declines a subscription or billing limit
+ * before it consults its retryable table, and a limit that resets in hours is
+ * not the safe repeat retry policy is for — so a wording that names one is
+ * refused here too, however it got its code.
+ *
+ * A code in more than one list is admitted by whichever recognition comes first;
+ * the ordering above is the whole of the precedence rule.
  * @param failure - the failure the adapter produced.
  * @param config - the resolved config.
  * @returns which recognition admitted it, or `null` to leave the finish alone.
  */
 export function widenBasis(failure: LlmFailure, config: ResolvedConfig): WidenBasis | null {
+  if (config.vetoMessages.some((pattern) => pattern.test(failure.message))) return null
+  if (config.transientCodes.includes(failure.code)
+    && config.transientMessages.some((pattern) => pattern.test(failure.message))) return 'transient'
   if (config.codes.includes(failure.code)) return 'catch-all'
   if (!config.statusOnlyCodes.includes(failure.code)) return null
   return config.statusOnlyMessages.some((pattern) => pattern.test(failure.message)) ? 'status-only' : null
 }
 
 /**
- * Decide whether one terminal reason is an unattributed empty attempt.
+ * The code one recognition writes.
  *
- * The order of the refusals is deliberate: what the attempt *produced* is
- * checked before what the failure says, because a retry that could duplicate
- * durable output is wrong whatever the code is.
+ * The transient recognition names the route (`SERVER`), the other two name the
+ * attempt's output (`EMPTY_RESPONSE`), so they do not share a target.
+ * @param basis - the recognition that admitted the failure.
+ * @param config - the resolved config.
+ * @returns the code the finish is rewritten to.
+ */
+export function targetCodeFor(basis: WidenBasis, config: ResolvedConfig): string {
+  return basis === 'transient' ? config.transientTargetCode : config.targetCode
+}
+
+/**
+ * Decide whether one terminal reason is an attempt this plugin should report
+ * under a code the retry policy admits.
+ *
+ * The refusals are ordered deliberately. What a failure *is* comes before what
+ * the attempt produced, because the first two recognitions rewrite the code to
+ * `EMPTY_RESPONSE` — a claim that the attempt produced nothing durable — so for
+ * them that claim is a precondition. The transient recognition makes no such
+ * claim (it writes a code about the route), and the harness's own executor
+ * agrees: `dsh-llm-retry` gates on `policy.retryableCodes.includes(failure.code)`
+ * and nothing else, so a `SERVER` the adapter named for a real `503` is repeated
+ * whether or not a token arrived first. Requiring an empty attempt here would
+ * make this plugin stricter than the policy it feeds, for a failure it can
+ * actually name.
  * @param reason - the finish reason the adapter produced.
  * @param producedContent - whether the attempt emitted any content-bearing chunk.
  * @param config - the resolved config.
@@ -491,11 +760,13 @@ export function classifyEmptyAttempt(
 ): LlmFailure | null {
   if (reason.kind !== 'error') return null
   const failure = reason.failure
-  if (producedContent) return null
-  if (widenBasis(failure, config) === null) return null
-  if (failure.code === config.targetCode) return null
+  const basis = widenBasis(failure, config)
+  if (basis === null) return null
+  if (producedContent && basis !== 'transient') return null
+  const targetCode = targetCodeFor(basis, config)
+  if (failure.code === targetCode) return null
   if (config.exceptMessages.some((pattern) => pattern.test(failure.message))) return null
-  return { ...failure, code: config.targetCode }
+  return { ...failure, code: targetCode }
 }
 
 /**
@@ -557,7 +828,7 @@ export async function* guardEmptyResponseStream(
           code: failure.code,
           basis,
           message: widened.message,
-          targetCode: config.targetCode,
+          targetCode: widened.code,
           provider: route.provider,
           model: route.model,
           verdict: config.mode,
@@ -595,14 +866,16 @@ export function apply(ctx: Context, config: Config = {}): void {
       { provider: options.provider, model: options.model },
       (evidence) => {
         ctx.logger.warn(
-          'empty-response-retry: %s/%s failed as %s with no content produced ("%s") — %s; %s (discussions #8321, #9352)',
+          'empty-response-retry: %s/%s failed as %s ("%s") — %s; %s (discussions #8321, #9352, #9397)',
           evidence.provider,
           evidence.model,
           evidence.code,
           evidence.message,
           evidence.basis === 'catch-all'
-            ? 'the adapter named no cause'
-            : 'named from the HTTP status line alone, with no provider body to read',
+            ? 'the adapter named no cause, and the attempt produced nothing'
+            : evidence.basis === 'status-only'
+              ? 'named from the HTTP status line alone, with no provider body to read'
+              : 'a wording pi-ai itself retries, which the adapter\'s rule chain cannot place',
           evidence.verdict === 'error'
             ? `reported as ${evidence.targetCode} so the retry policy can repeat the attempt`
             : 'left unchanged (warn mode)',

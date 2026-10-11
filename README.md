@@ -1,16 +1,18 @@
 # @argszero/cordis-plugin-empty-response-retry
 
-Makes an **unattributed empty model attempt** retryable — for the one seam that
-can tell that the attempt produced nothing.
+Makes an **unattributable model failure** retryable — for the one seam that sees
+an attempt and everything it produced.
 
-Answers two reports of the same missing evidence, reached from opposite sides of
-the classifier:
+Answers three reports of the same missing evidence:
 
 - [deepseek-ai/deepseek-harness discussion #8321](https://github.com/deepseek-ai/deepseek-harness/discussions/8321)
   — an empty response the adapter could not name at all (`PI_AI_ERROR`).
 - [deepseek-ai/deepseek-harness discussion #9352](https://github.com/deepseek-ai/deepseek-harness/discussions/9352)
   — a `400` with an empty body, named `INVALID_REQUEST` from the client's own
   status line.
+- [deepseek-ai/deepseek-harness discussion #9397](https://github.com/deepseek-ai/deepseek-harness/discussions/9397)
+  — a wording **pi-ai itself retries** that the adapter's rule chain cannot
+  place, so it falls to the same catch-all.
 
 ```sh
 npm install @argszero/cordis-plugin-empty-response-retry
@@ -20,10 +22,11 @@ npm install @argszero/cordis-plugin-empty-response-retry
 
 ## The gap
 
-There are two ways an attempt that produced nothing reaches the retry executor
-without a name, and each was reported separately (#8321 and #9352). This plugin
-handles both, because they are one fact: **the code was chosen without a
-provider-authored diagnosis.**
+There are three ways an attempt reaches the retry executor under a code nobody
+can act on, and each was reported separately (#8321, #9352 and #9397). This
+plugin handles all three, because they are one fact: **the code was chosen
+without a diagnosis that names what actually failed** — and, in the third case,
+the diagnosis existed upstream and was simply not carried across.
 
 ### Report #8321: the adapter could not name the wording at all
 
@@ -124,6 +127,56 @@ original. The request was never invalid.
 word the client managed to write. That is the same missing evidence as #8321, and
 it deserves the same treatment: repeat the step a bounded number of times.
 
+### Report #9397: the diagnosis existed upstream
+
+The third report arrives as one missing wording. It is really a **divergence
+between two tables**, and that is what this release acts on.
+
+A route behind a gateway ended a turn with:
+
+```
+assistant/attempt … "failure":{"message":"exceeded request buffer limit while retrying upstream","code":"PI_AI_ERROR"}
+```
+
+That sentence is Envoy's upstream-retry buffer limit — a `507` the gateway
+answered because it could not hold the request it was retrying. It carries no
+status number, and `classifyPiAiError`'s `5xx` rule is `/\b5\d\d\b/`: it needs
+the digits the gateway dropped. No other rule matches either, so the wording
+falls to the catch-all `PI_AI_ERROR` — which is in no retry table — and the turn
+ends.
+
+The reporter proposed one more alternative in the `SERVER` rule, and asked for it
+to stay **literal**, because the neighbouring `413` rule exists for a failure
+whose text shares both words — `Failed to buffer the request body: length limit
+exceeded` — and means the opposite. That rule's own comment says why:
+
+> A rejected request body (gateway or provider size cap): resending the same
+> request cannot succeed, so it is invalid, not transient.
+
+The observation generalizes. **pi-ai decides retryability from a table of its
+own, and the harness adapter's classifier is a second, partial transcription of
+it.** `isRetryableAssistantError` (`@earendil-works/pi-ai/dist/utils/retry.js`)
+tests the message against `RETRYABLE_PROVIDER_ERROR_PATTERN` — 49 alternatives at
+`0.87.1` (the reporter's version), 55 at `1.1.0` — *after* declining anything matching
+`NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription
+limits). Measured against the installed table:
+
+| | alternatives | the chain places | **it cannot place** |
+|---|---|---|---|
+| `0.87.1` | 49 | 25 | **24** |
+| `1.1.0` | 55 | 25 | **30** |
+
+Every unplaceable one falls to the catch-all and is never repeated — this
+report's sentence beside `overloaded`, `service unavailable`, `too many requests`,
+`getaddrinfo`, `ENOTFOUND`, `reset before headers` and the rest. `test/packaging.spec.mjs`
+holds that measurement as an assertion against the installed package, so a quiet
+upstream rewrite that closes the gap is visible rather than discovered.
+
+The report's framing — *one more wording in the `SERVER` rule* — would fix one
+line of that table. The framing here is the direction the two tables were built
+in: the retry decision is already in the SDK the harness calls, and what is
+missing is to read the same table on the way out.
+
 ---
 
 ## What this plugin does
@@ -161,8 +214,8 @@ Only the code changes. The provider's message, `status` and
 where a maintainer reads what the provider said and the code is the only field
 the policy reads.
 
-"Unattributed" has two shapes, and they are one principle — *a code chosen
-without a provider-authored diagnosis*:
+"Unattributed" has three shapes, and they are one principle — *a code chosen
+without a diagnosis that names what actually failed*:
 
 1. **`PI_AI_ERROR`** — the adapter's catch-all. No rule matched the provider's
    text at all. This is `codes`, for report #8321.
@@ -171,12 +224,47 @@ without a provider-authored diagnosis*:
    `statusOnlyCodes`, for report #9352, gated on the message by
    `statusOnlyMessages`: a `400` that carries the provider's words carries a
    diagnosis, and is left exactly as it is.
+3. **`PI_AI_ERROR` whose message is a wording pi-ai itself retries.** A third
+   case, and the widest of the three: the adapter could not place the wording, but
+   pi-ai could — the harness's classifier is a second, partial transcription of
+   the SDK's own retry table, and the gap between them is 24 wordings at `0.87.1`
+   and 30 at `1.1.0` (see report #9397 above). This is `transientCodes` (default:
+   `PI_AI_ERROR`), `transientMessages` (the server-shaped alternatives) and
+   `transientTargetCode` (default: `SERVER`, the code the chain *would* have
+   written had the rule seen the digits the gateway dropped):
 
-This is the **structural** fix both reports preferred over adding one more regex
-to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352), every
-one of which enumerated a new wording. It is at the layer that actually knows how
-much was produced, and it is wording-independent in the sense that matters: it
-never asks *what the provider said*, only *whether anyone said anything*.
+   ```ts
+   // before — a wording pi-ai retries, on a code no retry table admits
+   { type: 'finish', reason: { kind: 'error', failure: {
+     code: 'PI_AI_ERROR',
+     message: 'exceeded request buffer limit while retrying upstream' } } }
+
+   // …and after
+   { type: 'finish', reason: { kind: 'error', failure: {
+     code: 'SERVER',
+     message: 'exceeded request buffer limit while retrying upstream' } } }
+   ```
+
+   Unlike the first two, this recognition does **not** require the attempt to have
+   produced nothing: the code it writes is about the *route*, not about output,
+   and the harness's own gate proves it needs no such condition — `dsh-llm-retry`
+   decides on `policy.retryableCodes.includes(failure.code)` and nothing else, so
+   a `SERVER` the adapter reports for a real `503` is repeated whether or not the
+   stream got as far as a token. The third recognition restores that
+   classification; it does not invent a stricter one.
+
+Every recognition consults `vetoMessages` first — the alternatives pi-ai declares
+non-retryable (its `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`: quota, billing,
+subscription limits) — because pi-ai itself declines those **before** it consults
+the retryable table, and a limit that resets in hours is not the safe repeat this
+principle is about.
+
+This is the **structural** fix all three reports preferred over adding one more
+regex to a chain with a five-report history (#4361, #6595, #7691, #8321, #9352),
+every one of which enumerated a new wording. It is at the layer that actually
+knows how much was produced, and it is wording-independent in the sense that
+matters: for the first two recognitions it never asks *what the provider said*,
+only *whether anyone said anything*.
 
 For the second recognition the message gate is unavoidable — `INVALID_REQUEST` is
 also the correct code for a genuine malformed request, and only the message can
@@ -234,9 +322,22 @@ producer in the same voice is caught by the suite rather than in the field.
 - **The failure is one the adapter named from something the provider said.**
   `AUTH`, `CONTEXT_WINDOW_EXCEEDED`, `INVALID_CREDENTIAL`, `QUOTA`,
   `RATE_LIMIT` and the rest are somebody else's to recover from. Only codes
-  listed in `codes` (default: the catch-all `PI_AI_ERROR` alone) or in
+  listed in `codes` (default: the catch-all `PI_AI_ERROR` alone), in
   `statusOnlyCodes` (default: `INVALID_REQUEST` alone, and only in its bodyless
-  status-line form) are touched.
+  status-line form) or in `transientCodes` (default: the catch-all again, and only
+  for a wording pi-ai's own retry table carries) are touched.
+- **A message pi-ai declares non-retryable.** `vetoMessages` is consulted on every
+  recognition: quota, billing and subscription-limit wordings are left exactly as
+  the adapter wrote them, because pi-ai itself declines them before it consults
+  its retry table and a limit that resets in hours is not the safe repeat this
+  principle is about.
+- **A pi-ai-retryable wording this plugin does not claim.** The third recognition
+  ships the *server-shaped* half of pi-ai's table only. The transport-shaped
+  alternatives (`getaddrinfo`, `ENOTFOUND`, `reset before headers`,
+  `websocket …`, …) and the throttle-shaped ones (`too many requests`,
+  `ResourceExhausted`) are left alone, because `SERVER` would be the wrong name
+  for them and a wrong name in a durable log is the thing this plugin exists to
+  stop writing. `transientMessages` is the knob for an operator who wants them.
 - **A `400` that carries the provider's words.** `INVALID_REQUEST` is the one
   *named* code this plugin will widen, and only when the message is nothing but
   the HTTP client's own bodyless status line. A `400` with a body — the provider
@@ -279,8 +380,12 @@ code, and the provider's message.
 | `codes` | `['PI_AI_ERROR']` | Failure codes whose zero-output attempts are widened unconditionally — the adapter's catch-alls. |
 | `statusOnlyCodes` | `['INVALID_REQUEST']` | Failure codes widened **only** when the message is the HTTP client's own bodyless status line. |
 | `statusOnlyMessages` | the client's `… status code (no body)` sentence, and an empty JSON container | Regular-expression sources; a failure whose code is in `statusOnlyCodes` is widened only when its message matches one. Anchored at the end of the message. |
+| `transientCodes` | `['PI_AI_ERROR']` | Failure codes whose message is checked against pi-ai's own retry table — the third recognition (#9397). |
+| `transientMessages` | the server-shaped half of pi-ai's `RETRYABLE_PROVIDER_ERROR_PATTERN` at the version checked in `test/packaging.spec.mjs` | Regular-expression sources; a failure whose code is in `transientCodes` and whose message matches one is rewritten to `transientTargetCode`. |
+| `transientTargetCode` | `'SERVER'` | Code written for the third recognition — the name the classifier would have chosen had the wording carried the status number. |
+| `vetoMessages` | pi-ai's `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (quota, billing, subscription limits) | Regular-expression sources; a failure whose message matches any is left alone, on **every** recognition. Consulted before the retryable list, as pi-ai itself does. |
 | `exceptMessages` | `['^pi-ai ']` | Regular-expression sources; a failure whose message matches any is left exactly as the adapter wrote it. |
-| `targetCode` | `'EMPTY_RESPONSE'` | Code written on a widened finish. |
+| `targetCode` | `'EMPTY_RESPONSE'` | Code written on a widened finish by the first two recognitions. |
 
 A code listed in both `codes` and `statusOnlyCodes` is widened unconditionally,
 as `codes` describes — there is nothing left to gate.

@@ -15,6 +15,10 @@ import LlmRuntime, { EMPTY_RESPONSE_CODE } from '@deepseek-ai/dsh-llm'
 import {
   DEFAULT_STATUS_ONLY_CODES,
   DEFAULT_STATUS_ONLY_MESSAGES,
+  DEFAULT_TRANSIENT_CODES,
+  DEFAULT_TRANSIENT_MESSAGES,
+  DEFAULT_TRANSIENT_TARGET_CODE,
+  DEFAULT_VETO_MESSAGES,
   apply as applyPlugin,
   chunkCarriesContent,
   classifyEmptyAttempt,
@@ -22,6 +26,7 @@ import {
   inject,
   name,
   resolveConfig,
+  targetCodeFor,
   widenBasis,
 } from '../lib/index.js'
 import {
@@ -29,6 +34,7 @@ import {
   PENDING_TURN,
   REPORTED_EMPTY_TURN,
   REPORTED_STATUS_ONLY_TURN,
+  REPORTED_TRANSIENT_TURN,
   ScriptedAdapter,
   drain,
   finishOf,
@@ -70,15 +76,167 @@ test('the rewrite is announced on the host, naming the report', async () => {
   const [entry] = logged
   assert.equal(entry.type, 'warn')
   // The exporter hands over the printf template and its arguments separately.
-  assert.match(String(entry.args[0]), /^empty-response-retry: .*\(discussions #8321, #9352\)$/)
+  assert.match(String(entry.args[0]), /^empty-response-retry: .*\(discussions #8321, #9352, #9397\)$/)
   assert.deepEqual(entry.args.slice(1), [
     'openrouter',
     'deepseek/deepseek-v4.1-flash',
     'PI_AI_ERROR',
     'Provider returned an empty response',
-    'the adapter named no cause',
+    'the adapter named no cause, and the attempt produced nothing',
     'reported as EMPTY_RESPONSE so the retry policy can repeat the attempt',
   ])
+})
+
+/* ------------------------------------------------------------------ *
+ * the third reported turn — a wording the upstream SDK retries and the
+ * adapter's rule chain cannot place (discussion #9397)
+ * ------------------------------------------------------------------ */
+
+test('the reported buffer-limit turn is reported as a server failure, through the real llm/stream waterfall', async () => {
+  const { ctx } = await world({}, REPORTED_TRANSIENT_TURN)
+  const finish = await finishOf(ctx)
+  assert.equal(finish.reason.kind, 'error')
+  // `SERVER`, not `EMPTY_RESPONSE`: the gateway could not hold the request, and
+  // the attempt says nothing about what the model produced. `SERVER` is also the
+  // code the chain's own `/\b5\d\d\b/` rule writes for a `507` — this is the same
+  // failure, reported with the number the gateway dropped.
+  assert.equal(finish.reason.failure.code, 'SERVER')
+  assert.equal(finish.reason.failure.message, 'exceeded request buffer limit while retrying upstream')
+})
+
+test('control: unmounted, the same turn is the terminal PI_AI_ERROR the report describes', async () => {
+  const { ctx } = await world({}, REPORTED_TRANSIENT_TURN, { mount: false })
+  const finish = await finishOf(ctx)
+  assert.deepEqual(finish.reason.failure, {
+    message: 'exceeded request buffer limit while retrying upstream',
+    code: 'PI_AI_ERROR',
+  })
+})
+
+test('the third report is announced with the reason the wording was recognized', async () => {
+  const { ctx, logged } = await world({}, REPORTED_TRANSIENT_TURN)
+  await finishOf(ctx)
+  assert.equal(logged.length, 1)
+  assert.deepEqual(logged[0].args.slice(1), [
+    'openrouter',
+    'deepseek/deepseek-v4.1-flash',
+    'PI_AI_ERROR',
+    'exceeded request buffer limit while retrying upstream',
+    "a wording pi-ai itself retries, which the adapter's rule chain cannot place",
+    'reported as SERVER so the retry policy can repeat the attempt',
+  ])
+})
+
+test('a recognized transient is repeated even when the attempt had already streamed content', async () => {
+  // The asymmetry, and the harness's own gate is the reason for it: the retry
+  // executor answers on `policy.retryableCodes.includes(failure.code)` alone, so
+  // a `SERVER` the adapter named for a real 503 is repeated whatever arrived
+  // first. The other two recognitions write `EMPTY_RESPONSE`, a claim about the
+  // output, and require it to be empty.
+  const { ctx } = await world({}, [
+    { type: 'text-delta', index: 0, text: 'half an answer' },
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'upstream overloaded') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'SERVER')
+
+  // Control: the same shape on a wording pi-ai does not carry is left alone,
+  // because a partial answer must not be repeated to satisfy a guess.
+  const kept = await world({}, [
+    { type: 'text-delta', index: 0, text: 'half an answer' },
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'Provider returned an empty response') },
+  ])
+  assert.equal((await finishOf(kept.ctx)).reason.failure.code, 'PI_AI_ERROR')
+})
+
+test('the transient recognition is checked before the catch-all, so the code names the route', async () => {
+  // An empty attempt with a transient wording satisfies both recognitions. The
+  // specific one wins: the failure *is* attributed, and `EMPTY_RESPONSE` would
+  // assert something about the output that this failure does not say.
+  const { ctx } = await world({}, REPORTED_TRANSIENT_TURN)
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'SERVER')
+})
+
+test('a catch-all failure whose wording pi-ai does not carry is still an empty attempt', async () => {
+  // The gate, stated as a pair with the arm above: the same code, a message
+  // outside the table, and the old behaviour — `EMPTY_RESPONSE`, because the
+  // attempt produced nothing.
+  const { ctx } = await world({}, [
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'Provider returned an empty response') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, EMPTY_RESPONSE_CODE)
+})
+
+test('the deliberate 413 wording keeps its code: same words, opposite meaning', async () => {
+  // `failed to buffer the request body: length limit exceeded` shares "buffer"
+  // and "limit" with the reported sentence and means the opposite — resending it
+  // cannot succeed, which is why the adapter puts it on INVALID_REQUEST. The
+  // reporter asked for the match to stay literal for exactly this reason.
+  for (const message of [
+    'Failed to buffer the request body: length limit exceeded',
+    'request body too large',
+  ]) {
+    const { ctx } = await world({}, [
+      { type: 'finish', reason: REASON('INVALID_REQUEST', message) },
+    ])
+    assert.equal((await finishOf(ctx)).reason.failure.code, 'INVALID_REQUEST', `${message} must not be retried`)
+  }
+})
+
+test('transientCodes chooses which codes the wording test can reach', async () => {
+  const { ctx } = await world({ transientCodes: ['INVALID_REQUEST'] }, [
+    { type: 'finish', reason: REASON('INVALID_REQUEST', 'upstream overloaded') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'SERVER')
+
+  // …and the default code is then no longer reachable by it.
+  const narrowed = await world({ transientCodes: ['INVALID_REQUEST'] }, REPORTED_TRANSIENT_TURN)
+  assert.equal((await finishOf(narrowed.ctx)).reason.failure.code, EMPTY_RESPONSE_CODE)
+})
+
+test('transientMessages chooses which wordings count, and replaces the shipped list', async () => {
+  const { ctx } = await world({ transientMessages: ['^the origin is unwell$'] }, [
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'the origin is unwell') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'SERVER')
+
+  // Replaced, not appended: the shipped wording is no longer recognized, and an
+  // empty attempt on it falls back to the catch-all recognition.
+  const replaced = await world({ transientMessages: ['^the origin is unwell$'] }, REPORTED_TRANSIENT_TURN)
+  assert.equal((await finishOf(replaced.ctx)).reason.failure.code, EMPTY_RESPONSE_CODE)
+})
+
+test('transientTargetCode chooses what a transient failure is reported as', async () => {
+  const { ctx } = await world({ transientTargetCode: 'TRANSPORT' }, REPORTED_TRANSIENT_TURN)
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'TRANSPORT')
+})
+
+test('the veto declines a billing wording the adapter left unplaced', async () => {
+  // `billing` is not a wording the harness's own `isQuotaExceededError`
+  // recognizes, so it arrives on the catch-all — where, without the veto, the
+  // first recognition would have repeated a subscription limit five times.
+  for (const message of ['billing', 'available balance', 'out of budget', 'Monthly usage limit reached']) {
+    const { ctx } = await world({}, [
+      { type: 'finish', reason: REASON('PI_AI_ERROR', message) },
+    ])
+    assert.equal((await finishOf(ctx)).reason.failure.code, 'PI_AI_ERROR', `${message} must not be repeated`)
+  }
+
+  // Control: with the veto emptied, the same wording is widened — which is what
+  // makes the assertions above evidence about the veto rather than about the code.
+  const { ctx } = await world({ vetoMessages: ['^nothing matches this$'] }, [
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'billing') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, EMPTY_RESPONSE_CODE)
+})
+
+test('the veto outranks a wording an operator added to transientMessages', async () => {
+  // The order pi-ai itself uses: the limit table is consulted first, so a
+  // message that names a subscription limit is never a transient, however it was
+  // listed.
+  const { ctx } = await world({ transientMessages: ['out of budget'] }, [
+    { type: 'finish', reason: REASON('PI_AI_ERROR', 'out of budget') },
+  ])
+  assert.equal((await finishOf(ctx)).reason.failure.code, 'PI_AI_ERROR')
 })
 
 /* ------------------------------------------------------------------ *
@@ -372,6 +530,11 @@ test('resolveConfig fails loud on every field', () => {
   assert.throws(() => resolveConfig({ statusOnlyCodes: [] }), /`statusOnlyCodes` must be a non-empty array/)
   assert.throws(() => resolveConfig({ statusOnlyCodes: [''] }), /non-empty strings/)
   assert.throws(() => resolveConfig({ targetCode: '' }), /`targetCode` must be a non-empty string/)
+  assert.throws(() => resolveConfig({ transientCodes: [] }), /`transientCodes` must be a non-empty array/)
+  assert.throws(() => resolveConfig({ transientTargetCode: '' }), /`transientTargetCode` must be a non-empty string/)
+  assert.throws(() => resolveConfig({ vetoMessages: [] }), /`vetoMessages` must be a non-empty array/)
+  assert.throws(() => resolveConfig({ transientMessages: ['['] }), /`transientMessages` entry .* is not a valid regular expression/)
+  assert.throws(() => resolveConfig({ vetoMessages: ['['] }), /`vetoMessages` entry .* is not a valid regular expression/)
   assert.throws(() => resolveConfig({ exceptMessages: ['['] }), /not a valid regular expression/)
   assert.throws(() => resolveConfig({ statusOnlyMessages: ['['] }), /`statusOnlyMessages` entry .* is not a valid regular expression/)
   // The defaults are what the plugin ships with, so they must resolve.
@@ -379,11 +542,34 @@ test('resolveConfig fails loud on every field', () => {
   assert.equal(resolved.mode, 'error')
   assert.deepEqual(resolved.codes, ['PI_AI_ERROR'])
   assert.deepEqual(resolved.statusOnlyCodes, ['INVALID_REQUEST'])
+  assert.deepEqual(resolved.transientCodes, ['PI_AI_ERROR'])
   assert.equal(resolved.targetCode, EMPTY_RESPONSE_CODE)
+  assert.equal(resolved.transientTargetCode, DEFAULT_TRANSIENT_TARGET_CODE)
   assert.ok(resolved.exceptMessages[0].test('pi-ai stream error'))
   assert.ok(!resolved.exceptMessages[0].test('Provider returned an empty response'))
   // The adapter's own prefix rule must not swallow a client sentence either.
   assert.ok(!resolved.exceptMessages[0].test('400 status code (no body)'))
+  // The two pi-ai lists are compiled the way pi-ai compiles its own table, and
+  // the status-only gate is not: it transcribes what a client prints.
+  assert.equal(String(resolved.transientMessages[0]), String(new RegExp(DEFAULT_TRANSIENT_MESSAGES[0], 'i')))
+  assert.equal(String(resolved.vetoMessages[0]), String(new RegExp(DEFAULT_VETO_MESSAGES[0], 'i')))
+  assert.equal(String(resolved.statusOnlyMessages[0]), String(new RegExp(DEFAULT_STATUS_ONLY_MESSAGES[0])))
+})
+
+test('the shipped transient and veto defaults are the ones pi-ai&#39;s own tables carry', () => {
+  // Verbatim membership only. `test/packaging.spec.mjs` re-reads the installed
+  // pi-ai package and executes its predicate on each source, which is what makes
+  // these lists evidence about the upstream table rather than a transcription.
+  assert.deepEqual([...DEFAULT_TRANSIENT_CODES], ['PI_AI_ERROR'])
+  assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('exceeded request buffer limit while retrying upstream'))
+  assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('overloaded'))
+  assert.ok(DEFAULT_TRANSIENT_MESSAGES.includes('service.?unavailable'))
+  assert.ok(DEFAULT_VETO_MESSAGES.includes('billing'))
+  assert.ok(DEFAULT_VETO_MESSAGES.includes('available balance'))
+  // The exclusion wording and the reported wording must not collide: the plugin
+  // declines what the adapter authored, and widens what the provider relayed.
+  const exclusion = new RegExp('^pi-ai ')
+  for (const source of DEFAULT_TRANSIENT_MESSAGES) assert.ok(source.length > 0 && !exclusion.test(source))
 })
 
 /* ------------------------------------------------------------------ *
@@ -418,12 +604,24 @@ test('classifyEmptyAttempt: the whole predicate in one table', () => {
     classifyEmptyAttempt(REASON('INVALID_REQUEST', '400 status code (no body)'), false, config),
     { code: EMPTY_RESPONSE_CODE, message: '400 status code (no body)' },
   )
+  assert.deepEqual(
+    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'exceeded request buffer limit while retrying upstream'), false, config),
+    { code: 'SERVER', message: 'exceeded request buffer limit while retrying upstream' },
+  )
+  // The transient recognition is the one that does not need an empty attempt.
+  assert.deepEqual(
+    classifyEmptyAttempt(REASON('PI_AI_ERROR', 'upstream overloaded'), true, config),
+    { code: 'SERVER', message: 'upstream overloaded' },
+  )
   const no = [
     [REASON('PI_AI_ERROR', 'Provider returned an empty response'), true],
     [REASON('PI_AI_ERROR', 'pi-ai stream error'), false],
     [REASON('PI_AI_ERROR', 'pi-ai stream for model "m" ended pending'), false],
+    [REASON('PI_AI_ERROR', 'billing'), false],
+    [REASON('PI_AI_ERROR', 'out of budget'), true],
     [REASON('RATE_LIMIT', '429'), false],
     [REASON(EMPTY_RESPONSE_CODE, 'already widened'), false],
+    [REASON('SERVER', 'upstream overloaded'), false],
     [REASON('INVALID_REQUEST', '400 status code (no body)'), true],
     [{ kind: 'stop' }, false],
     [{ kind: 'max-tokens' }, false],
@@ -435,10 +633,28 @@ test('classifyEmptyAttempt: the whole predicate in one table', () => {
   }
 })
 
+test('targetCodeFor: the transient recognition names the route, the others name the output', () => {
+  const config = resolveConfig()
+  assert.equal(targetCodeFor('transient', config), DEFAULT_TRANSIENT_TARGET_CODE)
+  assert.equal(targetCodeFor('catch-all', config), EMPTY_RESPONSE_CODE)
+  assert.equal(targetCodeFor('status-only', config), EMPTY_RESPONSE_CODE)
+  const custom = resolveConfig({ targetCode: 'QUOTA', transientTargetCode: 'RATE_LIMIT' })
+  assert.equal(targetCodeFor('transient', custom), 'RATE_LIMIT')
+  assert.equal(targetCodeFor('catch-all', custom), 'QUOTA')
+})
+
 test('widenBasis: which recognition admits a code, and what it refuses', () => {
   const config = resolveConfig()
   const basis = (code, message) => widenBasis({ code, message }, config)
-  // The catch-all is admitted on the code alone…
+  // The transient wording is the most specific recognition, and it is checked
+  // first…
+  assert.equal(basis('PI_AI_ERROR', 'exceeded request buffer limit while retrying upstream'), 'transient')
+  assert.equal(basis('PI_AI_ERROR', 'upstream overloaded'), 'transient')
+  assert.equal(basis('PI_AI_ERROR', 'Service Unavailable'), 'transient')
+  assert.equal(basis('PI_AI_ERROR', 'Provider returned error'), 'transient')
+  // …while a code the wording list cannot reach stays untouched by it…
+  assert.equal(basis('SERVER', 'upstream overloaded'), null)
+  // …and the catch-all is admitted on the code alone…
   assert.equal(basis('PI_AI_ERROR', 'Provider returned an empty response'), 'catch-all')
   assert.equal(basis('PI_AI_ERROR', 'anything at all'), 'catch-all')
   // …the status-only code only when the message is nothing but a status line…
@@ -453,10 +669,18 @@ test('widenBasis: which recognition admits a code, and what it refuses', () => {
   assert.equal(basis('AUTH', '401 status code (no body)'), null)
   assert.equal(basis('SERVER', '500 status code (no body)'), null)
   assert.equal(basis('QUOTA_EXCEEDED', 'quota'), null)
+  // The veto precedes every recognition, and it is case-insensitive like its source.
+  assert.equal(basis('PI_AI_ERROR', 'BILLING'), null)
+  assert.equal(basis('PI_AI_ERROR', 'insufficient_quota'), null)
+  assert.equal(basis('INVALID_REQUEST', 'billing'), null)
+  assert.equal(basis('PI_AI_ERROR', 'out of budget but also overloaded'), null)
 
   // A code in both lists is admitted the first way: there is nothing left to gate.
   const blunt = resolveConfig({ codes: ['PI_AI_ERROR', 'INVALID_REQUEST'] })
   assert.equal(widenBasis({ code: 'INVALID_REQUEST', message: '400 invalid request' }, blunt), 'catch-all')
+  // …and the transient recognition is the first way when its wording matches.
+  const transient = resolveConfig({ transientCodes: ['INVALID_REQUEST'] })
+  assert.equal(widenBasis({ code: 'INVALID_REQUEST', message: 'upstream overloaded' }, transient), 'transient')
 })
 
 test('the shipped gate defaults are the shapes the installed clients write', () => {

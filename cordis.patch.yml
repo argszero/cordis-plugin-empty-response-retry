@@ -52,6 +52,37 @@
 #     (`statusOnlyMessages`) — a `400` that carries the provider's words is a
 #     diagnosis and is left exactly as the adapter wrote it.
 #
+# Discussion #9397 adds the third report, and with it the finding this release
+# acts on. A route behind a gateway ended the turn with
+#
+#   "failure":{"message":"exceeded request buffer limit while retrying upstream",
+#              "code":"PI_AI_ERROR"}
+#
+# — Envoy's upstream-retry buffer limit (a 507 the gateway answered because it
+# could not hold the request it was retrying). It carries no status number, and
+# the classifier's 5xx rule needs the digits the gateway dropped, so the wording
+# falls to the catch-all and the turn ends unrepeated.
+#
+# The reporter proposed one more alternative in the SERVER rule. The observation
+# generalizes: pi-ai decides retryability from a table of its own
+# (`RETRYABLE_PROVIDER_ERROR_PATTERN` — 49 alternatives at 0.87.1, 55 at 1.1.0),
+# and the adapter's `classifyPiAiError` is a second, partial transcription of it:
+# 24 of the reporter's 49 alternatives are wordings the chain cannot place, and
+# every one lands on the catch-all.
+#
+# So the third recognition reads the same table on the way out. A failure
+#   * whose code is listed in `transientCodes` (default: the catch-all), and
+#   * whose message matches `transientMessages` (the server-shaped half of pi-ai's
+#     own retry table), and
+#   * whose message does not match `vetoMessages` (pi-ai's
+#     NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN — quota, billing, subscription
+#     limits, declined first exactly as pi-ai declines them),
+# is rewritten to `transientTargetCode` (default `SERVER`, the name the chain
+# would have written had it seen the digits). Unlike the first two recognitions it
+# needs no "produced nothing" condition, because the code is about the route, not
+# about output: `dsh-llm-retry` decides on `retryableCodes.includes(code)` alone, so
+# a SERVER the adapter reports for a real 503 is repeated either way.
+#
 # The retry executor then accepts the step on its own unchanged code gate. Only
 # the code changes: the provider's message, status and `providerRetryAfterMs` are
 # carried through, so the session log still shows what the provider said.

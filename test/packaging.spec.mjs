@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import semver from 'semver'
 
-import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, resolveConfig } from '../lib/index.js'
-import { REPORTED_STATUS_ONLY_TURN, clientSentence, observedMessage } from './harness.mjs'
+import { DEFAULT_CODES, DEFAULT_EXCEPT_MESSAGES, DEFAULT_STATUS_ONLY_CODES, DEFAULT_STATUS_ONLY_MESSAGES, DEFAULT_TARGET_CODE, DEFAULT_TRANSIENT_MESSAGES, DEFAULT_TRANSIENT_TARGET_CODE, DEFAULT_VETO_MESSAGES, resolveConfig } from '../lib/index.js'
+import { REPORTED_STATUS_ONLY_TURN, REPORTED_TRANSIENT_TURN, clientSentence, observedMessage } from './harness.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
@@ -167,7 +167,7 @@ test('every manifest entry point is in the tarball, and the patch names this plu
   assert.equal(manifest.dsh.bundle.patch, './cordis.patch.yml', 'the bundle patch declaration points at the shipped file')
   const patch = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8')
   assert.ok(patch.includes(manifest.name), 'the bundle patch must mount this package by name')
-  for (const report of ['#8321', '#9352']) {
+  for (const report of ['#8321', '#9352', '#9397']) {
     assert.ok(patch.includes(report), `the bundle patch must name the report it answers: ${report} missing`)
   }
 })
@@ -321,9 +321,117 @@ test('the shipped status-only defaults are the ones the second report asks for',
   }
 })
 
-test('the README documents both recognitions and both gates', () => {
+test('the README documents every recognition and every gate', () => {
   const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
-  for (const token of ['#8321', '#9352', 'statusOnlyCodes', 'statusOnlyMessages', 'PI_AI_ERROR', 'INVALID_REQUEST']) {
+  for (const token of [
+    '#8321', '#9352', '#9397',
+    'statusOnlyCodes', 'statusOnlyMessages',
+    'transientCodes', 'transientMessages', 'transientTargetCode',
+    'vetoMessages',
+    'PI_AI_ERROR', 'INVALID_REQUEST', 'SERVER',
+  ]) {
     assert.ok(readme.includes(token), `the README must document ${token}`)
   }
+})
+
+/* ------------------------------------------------------------------ *
+ * the third report's evidence: pi-ai's own tables, read from the
+ * installed package (discussion #9397)
+ * ------------------------------------------------------------------ */
+
+/** The path of the installed pi-ai module that builds both retry tables. */
+const piAiRetry = fileURLToPath(import.meta.resolve('@earendil-works/pi-ai/utils/retry'))
+
+/**
+ * One `buildProviderErrorPattern([...])` alternative list, as the installed
+ * package writes it.
+ *
+ * Read as text rather than imported, because the two tables are module-private:
+ * `isRetryableAssistantError` exports the *decision*, not the wording it decided
+ * from, and a witness of the decision alone could not catch a reworded table.
+ */
+function piAiTable(name) {
+  const source = readFileSync(piAiRetry, 'utf8')
+  const start = source.indexOf(`const ${name} = buildProviderErrorPattern([`)
+  assert.ok(start > 0, `the installed pi-ai no longer declares ${name}`)
+  const open = source.indexOf('[', start)
+  let depth = 0
+  let end = open
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === '[') depth += 1
+    else if (source[index] === ']') { depth -= 1; if (depth === 0) { end = index; break } }
+  }
+  assert.ok(end > open, `could not read ${name}'s alternative list`)
+  return [...source.slice(open + 1, end).matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((match) => JSON.parse(`"${match[1]}"`))
+}
+
+/**
+ * A message one pattern alternative could be written for.
+ *
+ * A pattern is not a message, so each source is relaxed into a sample: `.?` and
+ * `X?` become what the author would have typed. Every sample therefore matches
+ * the source it came from by construction, which is all the tests below need.
+ */
+function sampleOf(source) {
+  return source.replace(/\.\?/g, ' ').replace(/(\w)\?/g, '$1')
+}
+
+/** pi-ai's own retryability decision, from the installed package. */
+async function piAiRetryable(message) {
+  const { isRetryableAssistantError } = await import('@earendil-works/pi-ai/utils/retry')
+  return isRetryableAssistantError({ stopReason: 'error', errorMessage: message })
+}
+
+test('every shipped transient wording is one pi-ai retries and the installed classifier cannot place', async () => {
+  const classify = await installedClassifier()
+  const retryable = piAiTable('RETRYABLE_PROVIDER_ERROR_PATTERN')
+  assert.ok(retryable.length >= 40, `expected pi-ai's retry table, saw ${retryable.length} alternatives`)
+  for (const source of DEFAULT_TRANSIENT_MESSAGES) {
+    assert.ok(retryable.includes(source), `pi-ai's retry table no longer carries ${JSON.stringify(source)} — this plugin is shipping a wording upstream dropped`)
+    const message = sampleOf(source)
+    assert.ok(new RegExp(source, 'i').test(message), `${JSON.stringify(source)} does not even match its own sample`)
+    assert.ok(await piAiRetryable(message), `pi-ai does not retry ${JSON.stringify(message)}; widening it would not be restoring pi-ai's judgement`)
+    assert.equal(classify(message), 'PI_AI_ERROR', `the installed classifier places ${JSON.stringify(message)}, so this plugin has nothing to restore for it`)
+  }
+})
+
+test('every shipped veto wording is one pi-ai declines', async () => {
+  const limits = piAiTable('NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN')
+  assert.ok(limits.length >= 5, `expected pi-ai's limit table, saw ${limits.length} alternatives`)
+  for (const source of DEFAULT_VETO_MESSAGES) {
+    assert.ok(limits.includes(source), `pi-ai's limit table no longer carries ${JSON.stringify(source)}`)
+    const message = sampleOf(source)
+    assert.ok(!await piAiRetryable(message), `pi-ai retries ${JSON.stringify(message)}, so vetoing it contradicts the table this plugin cites`)
+  }
+})
+
+test('the #9397 wording is the installed stack’s: pi-ai retries it, the installed classifier drops it', async () => {
+  const classify = await installedClassifier()
+  const [failure] = REPORTED_TRANSIENT_TURN.map((chunk) => chunk.reason?.failure).filter(Boolean)
+  assert.equal(failure.code, classify(failure.message), 'the fixture must carry the code the installed classifier gives it')
+  assert.equal(classify(failure.message), 'PI_AI_ERROR', 'the report is that the catch-all swallows this wording')
+  assert.ok(await piAiRetryable(failure.message), 'and that pi-ai itself would have retried it')
+})
+
+test('the two tables still disagree, and this plugin still covers the half it claims', async () => {
+  // The finding, held as an assertion: pi-ai retries wordings the adapter's rule
+  // chain cannot place, so they land on a code no retry table admits. The count
+  // is a floor, not a measurement — a sample is a sample — and it exists so a
+  // quiet upstream rewrite that *closes* the gap, or widens it, is visible here
+  // rather than discovered as a stale default in the field.
+  const classify = await installedClassifier()
+  const retryable = piAiTable('RETRYABLE_PROVIDER_ERROR_PATTERN')
+  const placeable = new Set(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
+  const unplaced = retryable.filter((source) => !placeable.has(classify(sampleOf(source))))
+  assert.ok(
+    unplaced.length >= 24,
+    `expected at least 24 pi-ai-retryable wordings the classifier cannot place, saw ${unplaced.length}: ${unplaced.join(', ')}`,
+  )
+  // And what this plugin restores is a strict subset of that gap — the
+  // server-shaped wordings, which is the half that has a name it can defend.
+  for (const source of DEFAULT_TRANSIENT_MESSAGES) {
+    assert.ok(unplaced.includes(source), `${JSON.stringify(source)} is no longer part of the gap`)
+  }
+  assert.ok(DEFAULT_TRANSIENT_MESSAGES.length < unplaced.length, 'the default list is a narrowing of the gap, not a copy of it')
+  assert.equal(DEFAULT_TRANSIENT_TARGET_CODE, 'SERVER')
 })
